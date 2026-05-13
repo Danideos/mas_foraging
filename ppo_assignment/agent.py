@@ -7,7 +7,6 @@ import torch
 from torch.distributions import Categorical
 
 from .controller import (
-    all_agents_completed_macro_goals,
     candidate_goals_for_agent,
     critic_goals,
     extract_objects,
@@ -37,6 +36,8 @@ class AutoregressiveAssignmentPPOAgent:
         entropy_coef=0.01,
         ppo_epochs=4,
         max_plan_steps=None,
+        repeated_sync_penalty=0.0,
+        free_syncs_after_object=1,
     ):
         self.w = w
         self.h = h
@@ -49,6 +50,8 @@ class AutoregressiveAssignmentPPOAgent:
         self.entropy_coef = entropy_coef
         self.ppo_epochs = ppo_epochs
         self.max_plan_steps = max_plan_steps if max_plan_steps is not None else max(h + w, 10)
+        self.repeated_sync_penalty = repeated_sync_penalty
+        self.free_syncs_after_object = free_syncs_after_object
 
         self.actor = Actor(hidden_dim=hidden_dim).to(self.device)
         self.critic = Critic(hidden_dim=hidden_dim).to(self.device)
@@ -85,12 +88,25 @@ class AutoregressiveAssignmentPPOAgent:
         self.last_object_count = None
         self.current_macro = None
         self.sync_bumped = {}
+        self.goal_completed = {}
+        self.sync_usage_counts = {agent_idx: 0 for agent_idx in range(self.agents)}
         self.pending_sync_bump_agents = set()
+
+    def sync_free_flags(self):
+        return [
+            1.0 if self.sync_usage_counts.get(agent_idx, 0) < self.free_syncs_after_object else 0.0
+            for agent_idx in range(self.agents)
+        ]
 
     def action(self, state, deterministic=False):
         world_map, agent_locations = state
         objects = extract_objects(world_map)
         current_object_count = len(objects)
+
+        if self.active_plan is not None:
+            for agent_idx, goal in self.active_plan.items():
+                if goal[0] == "object" and manhattan(agent_locations[agent_idx], goal) == 0:
+                    self.goal_completed[agent_idx] = True
 
         if current_object_count == 0:
             self.last_object_count = current_object_count
@@ -100,10 +116,13 @@ class AutoregressiveAssignmentPPOAgent:
             self.last_object_count is not None
             and current_object_count < self.last_object_count
         )
+        if object_collected:
+            self.sync_usage_counts = {agent_idx: 0 for agent_idx in range(self.agents)}
+
         goals_completed = (
             self.active_plan is not None
             and current_object_count > 0
-            and all_agents_completed_macro_goals(agent_locations, self.active_plan, self.sync_bumped)
+            and all(self.goal_completed.get(agent_idx, False) for agent_idx in self.active_plan)
         )
         max_plan_steps_reached = self.active_plan is not None and self.plan_duration >= self.max_plan_steps
         need_decision = (
@@ -125,17 +144,24 @@ class AutoregressiveAssignmentPPOAgent:
                 self.close_current_macro(next_state=state, done=False)
 
             with torch.no_grad():
+                decision_sync_free = self.sync_free_flags()
                 active_plan, target_indices, agent_order, joint_logprob, joint_entropy = self.make_assignment_decision(
                     state,
                     deterministic=deterministic,
+                    sync_free=decision_sync_free,
                 )
                 goals = critic_goals(world_map, agent_locations, self.h, self.w)
-                value = self.critic(state, self.h, self.w, self.agents, goals)
+                value = self.critic(state, self.h, self.w, self.agents, goals, sync_free=decision_sync_free)
 
             self.active_plan = active_plan
+            repeated_sync_penalty = 0.0
             self.rollout_metrics["goal_choice_count"] += len(active_plan)
             for agent_idx, goal in active_plan.items():
                 if goal[0] == "sync":
+                    usage_count = self.sync_usage_counts.get(agent_idx, 0) + 1
+                    self.sync_usage_counts[agent_idx] = usage_count
+                    if usage_count > self.free_syncs_after_object:
+                        repeated_sync_penalty += self.repeated_sync_penalty * usage_count
                     self.rollout_metrics["sync_choice_count"] += 1
                     if manhattan(agent_locations[agent_idx], goal) == 0:
                         self.rollout_metrics["zero_distance_sync_choice_count"] += 1
@@ -144,6 +170,7 @@ class AutoregressiveAssignmentPPOAgent:
                 for agent_idx, goal in active_plan.items()
                 if goal[0] == "sync"
             }
+            self.goal_completed = {agent_idx: False for agent_idx in active_plan}
             self.pending_sync_bump_agents = set()
             self.current_macro = {
                 "decision_state": self.copy_state(state),
@@ -153,8 +180,9 @@ class AutoregressiveAssignmentPPOAgent:
                 "old_joint_logprob": float(joint_logprob.detach().cpu().item()),
                 "old_value": float(value.detach().cpu().item()),
                 "old_entropy": float(joint_entropy.detach().cpu().item()),
-                "macro_reward": 0.0,
+                "macro_reward": -repeated_sync_penalty,
                 "duration": 0,
+                "decision_sync_free": decision_sync_free,
             }
             self.plan_duration = 0
 
@@ -183,7 +211,7 @@ class AutoregressiveAssignmentPPOAgent:
                 actions.append(goals_to_actions([agent_pos], {0: goal}, self.h, self.w)[0])
         return actions
 
-    def make_assignment_decision(self, state, deterministic=False):
+    def make_assignment_decision(self, state, deterministic=False, sync_free=None):
         world_map, agent_locations = state
         encoder_goals = critic_goals(world_map, agent_locations, self.h, self.w)
         if not encoder_goals:
@@ -195,6 +223,7 @@ class AutoregressiveAssignmentPPOAgent:
             self.w,
             self.agents,
             encoder_goals,
+            sync_free=sync_free,
         )
         agent_order = list(range(len(agent_locations)))
         if deterministic:
@@ -255,6 +284,7 @@ class AutoregressiveAssignmentPPOAgent:
         for agent_idx in self.pending_sync_bump_agents:
             if agent_idx in self.sync_bumped and not self.sync_bumped[agent_idx]:
                 self.sync_bumped[agent_idx] = True
+                self.goal_completed[agent_idx] = True
                 self.rollout_metrics["sync_bump_completed_count"] += 1
         self.pending_sync_bump_agents.clear()
 
@@ -272,6 +302,7 @@ class AutoregressiveAssignmentPPOAgent:
         self.active_plan = None
         self.current_macro = None
         self.sync_bumped = {}
+        self.goal_completed = {}
         self.pending_sync_bump_agents = set()
 
     def close_current_macro(self, next_state, done):
@@ -289,11 +320,13 @@ class AutoregressiveAssignmentPPOAgent:
                 duration=int(macro["duration"]),
                 next_decision_state=self.copy_state(next_state),
                 done=bool(done),
+                decision_sync_free=list(macro["decision_sync_free"]),
+                next_decision_sync_free=self.sync_free_flags(),
             )
         )
         self.current_macro = None
 
-    def recompute_logprob(self, decision_state, agent_order, targets, target_indices=None):
+    def recompute_logprob(self, decision_state, agent_order, targets, target_indices=None, sync_free=None):
         world_map, agent_locations = decision_state
         encoder_goals = critic_goals(world_map, agent_locations, self.h, self.w)
         if not encoder_goals:
@@ -305,6 +338,7 @@ class AutoregressiveAssignmentPPOAgent:
             self.w,
             self.agents,
             encoder_goals,
+            sync_free=sync_free,
         )
         previous_decision_tokens = []
         new_joint_logprob = torch.tensor(0.0, device=self.device)
@@ -363,6 +397,7 @@ class AutoregressiveAssignmentPPOAgent:
 
     def recompute_logprob_batch(self, transitions):
         states = [transition.decision_state for transition in transitions]
+        sync_free_batch = [transition.decision_sync_free for transition in transitions]
         encoder_goals_batch = [critic_goals(state[0], state[1], self.h, self.w) for state in states]
         if not encoder_goals_batch or len(encoder_goals_batch[0]) == 0:
             zeros = torch.zeros(len(transitions), dtype=torch.float32, device=self.device)
@@ -375,6 +410,7 @@ class AutoregressiveAssignmentPPOAgent:
             self.w,
             self.agents,
             encoder_goals_batch,
+            sync_free_batch=sync_free_batch,
         )
 
         previous_decision_tokens = []
@@ -450,7 +486,7 @@ class AutoregressiveAssignmentPPOAgent:
 
         return new_joint_logprob, new_entropy
 
-    def critic_values_batch(self, states):
+    def critic_values_batch(self, states, sync_free_batch=None):
         if not states:
             return torch.empty(0, dtype=torch.float32, device=self.device)
 
@@ -465,12 +501,14 @@ class AutoregressiveAssignmentPPOAgent:
         for indices in groups.values():
             group_states = [states[idx] for idx in indices]
             group_goals = [goals_cache[idx] for idx in indices]
+            group_sync_free = None if sync_free_batch is None else [sync_free_batch[idx] for idx in indices]
             group_values = self.critic.forward_batch(
                 group_states,
                 self.h,
                 self.w,
                 self.agents,
                 group_goals,
+                sync_free_batch=group_sync_free,
             )
             for offset, original_idx in enumerate(indices):
                 values[original_idx] = group_values[offset]
@@ -506,7 +544,10 @@ class AutoregressiveAssignmentPPOAgent:
         recompute_logprob_sec = 0.0
         with torch.no_grad():
             critic_start = time.perf_counter()
-            next_values = self.critic_values_batch([transition.next_decision_state for transition in transitions])
+            next_values = self.critic_values_batch(
+                [transition.next_decision_state for transition in transitions],
+                sync_free_batch=[transition.next_decision_sync_free for transition in transitions],
+            )
             critic_value_sec += time.perf_counter() - critic_start
             macro_rewards = torch.tensor(
                 [transition.macro_reward for transition in transitions],
@@ -546,7 +587,10 @@ class AutoregressiveAssignmentPPOAgent:
             new_logprob_tensor, new_entropy_tensor = self.recompute_logprob_all_batched(transitions)
             recompute_logprob_sec += time.perf_counter() - recompute_start
             critic_start = time.perf_counter()
-            new_value_tensor = self.critic_values_batch([transition.decision_state for transition in transitions])
+            new_value_tensor = self.critic_values_batch(
+                [transition.decision_state for transition in transitions],
+                sync_free_batch=[transition.decision_sync_free for transition in transitions],
+            )
             critic_value_sec += time.perf_counter() - critic_start
             old_logprob_tensor = torch.tensor(
                 [
@@ -596,27 +640,28 @@ class AutoregressiveAssignmentPPOAgent:
         self.last_update_stats = stats
         return stats
 
-    def save(self, path):
-        torch.save(
-            {
-                "actor": self.actor.state_dict(),
-                "critic": self.critic.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-                "config": {
-                    "w": self.w,
-                    "h": self.h,
-                    "agents": self.agents,
-                    "gamma": self.gamma,
-                    "gae_lambda": self.gae_lambda,
-                    "clip_eps": self.clip_eps,
-                    "value_coef": self.value_coef,
+    def save(self, path, **metadata):
+        checkpoint = {
+            "actor": self.actor.state_dict(),
+            "critic": self.critic.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "config": {
+                "w": self.w,
+                "h": self.h,
+                "agents": self.agents,
+                "gamma": self.gamma,
+                "gae_lambda": self.gae_lambda,
+                "clip_eps": self.clip_eps,
+                "value_coef": self.value_coef,
                     "entropy_coef": self.entropy_coef,
                     "ppo_epochs": self.ppo_epochs,
                     "max_plan_steps": self.max_plan_steps,
+                    "repeated_sync_penalty": self.repeated_sync_penalty,
+                    "free_syncs_after_object": self.free_syncs_after_object,
                 },
-            },
-            path,
-        )
+            }
+        checkpoint.update(metadata)
+        torch.save(checkpoint, path)
 
     def load(self, path, load_optimizer=True):
         checkpoint = torch.load(path, map_location=self.device)
@@ -624,6 +669,7 @@ class AutoregressiveAssignmentPPOAgent:
         self.critic.load_state_dict(checkpoint["critic"])
         if load_optimizer and "optimizer" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
+        return checkpoint
 
     @staticmethod
     def copy_state(state):

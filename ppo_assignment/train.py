@@ -4,6 +4,7 @@ import csv
 import json
 import os
 import random
+import re
 import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
@@ -184,6 +185,8 @@ def make_agent_kwargs(args, device):
         "entropy_coef": args.entropy_coef,
         "ppo_epochs": args.ppo_epochs,
         "max_plan_steps": args.max_plan_steps,
+        "repeated_sync_penalty": args.repeated_sync_penalty,
+        "free_syncs_after_object": args.free_syncs_after_object,
     }
 
 
@@ -219,6 +222,8 @@ def transition_to_plain(t):
         "duration": int(t.duration),
         "next_decision_state": copy.deepcopy(t.next_decision_state),
         "done": bool(t.done),
+        "decision_sync_free": copy.deepcopy(t.decision_sync_free),
+        "next_decision_sync_free": copy.deepcopy(t.next_decision_sync_free),
     }
 
 
@@ -235,6 +240,8 @@ def transition_from_plain(d):
         duration=int(d["duration"]),
         next_decision_state=d["next_decision_state"],
         done=bool(d["done"]),
+        decision_sync_free=d["decision_sync_free"],
+        next_decision_sync_free=d["next_decision_sync_free"],
     )
 
 
@@ -293,7 +300,7 @@ def collect_rollouts_serial(env_args, agent, args, progress, update, last_eval_r
         macros.append(macro_count)
         progress.update(1)
         progress.set_postfix(
-            update=f"{update}/{args.updates}",
+            update=f"{update}/{getattr(args, 'end_update', args.updates)}",
             ep=f"{episode}/{args.episodes_per_update}",
             reward=f"{reward:.2f}",
             length=length,
@@ -351,7 +358,7 @@ def collect_rollouts_parallel(agent, args, progress, update, last_eval_reward, e
             completed += len(chunk_rewards)
             progress.update(len(chunk_rewards))
             progress.set_postfix(
-                update=f"{update}/{args.updates}",
+                update=f"{update}/{getattr(args, 'end_update', args.updates)}",
                 ep=f"{completed}/{args.episodes_per_update}",
                 reward=f"{chunk_rewards[-1]:.2f}",
                 length=chunk_lengths[-1],
@@ -371,7 +378,7 @@ def parse_args():
     parser.add_argument("--height", type=int, default=5)
     parser.add_argument("--objects", type=int, default=10)
     parser.add_argument("--agents", type=int, default=5)
-    parser.add_argument("--updates", type=int, default=1000)
+    parser.add_argument("--updates", type=int, default=1000, help="Updates to run. With --resume/--resume-from, this is the number of additional updates.")
     parser.add_argument("--episodes-per-update", type=int, default=16)
     parser.add_argument("--eval-every", type=int, default=25)
     parser.add_argument("--eval-episodes", type=int, default=10)
@@ -384,11 +391,33 @@ def parse_args():
     parser.add_argument("--entropy-coef", type=float, default=0.01)
     parser.add_argument("--ppo-epochs", type=int, default=4)
     parser.add_argument("--max-plan-steps", type=int, default=None)
+    parser.add_argument(
+        "--repeated-sync-penalty",
+        type=float,
+        default=0.0,
+        help="Penalty for sync choices after the free sync budget. Cost is penalty * nth sync use since the last object collection.",
+    )
+    parser.add_argument(
+        "--free-syncs-after-object",
+        type=int,
+        default=1,
+        help="Free sync choices per agent after each object collection before repeated sync penalties apply.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--run-name", default=None, help="Name for runs/<run-name> outputs.")
     parser.add_argument("--runs-dir", default="runs", help="Base directory for run outputs.")
     parser.add_argument("--checkpoint", default=None, help="Checkpoint path. Defaults to runs/<run-name>/checkpoints/latest.pt.")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Load the checkpoint path before training and continue update numbering/logging when possible.",
+    )
+    parser.add_argument(
+        "--resume-from",
+        default=None,
+        help="Checkpoint to load before training. Saves future latest checkpoints to --checkpoint, or runs/<run-name>/checkpoints/latest.pt by default.",
+    )
     parser.add_argument("--keep-best-checkpoints", type=int, default=5, help="Keep the top N eval checkpoints by reward. Use 0 to disable.")
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress reporting.")
     parser.add_argument("--print-every", type=int, default=0, help="Also print update stats every N updates.")
@@ -423,15 +452,43 @@ def create_run_paths(args):
     return run_name, run_dir, log_dir, checkpoint_path
 
 
-def write_config(log_dir, args, run_name, checkpoint_path):
+def write_config(log_dir, args, run_name, checkpoint_path, resume_path=None):
     config = vars(args).copy()
     config["run_name"] = run_name
     config["checkpoint_path"] = str(checkpoint_path)
+    config["resume_path"] = "" if resume_path is None else str(resume_path)
     with open(log_dir / "config.json", "w", encoding="utf-8") as handle:
         json.dump(config, handle, indent=2, sort_keys=True)
 
 
-def make_metrics_writer(log_dir):
+def read_last_metrics_update(metrics_path):
+    if not metrics_path.exists():
+        return 0, None
+
+    last_update = 0
+    last_eval_reward = None
+    with open(metrics_path, newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            try:
+                last_update = max(last_update, int(row.get("update") or 0))
+            except ValueError:
+                pass
+            eval_reward = row.get("eval_avg_reward")
+            if eval_reward not in (None, ""):
+                try:
+                    last_eval_reward = float(eval_reward)
+                except ValueError:
+                    pass
+    return last_update, last_eval_reward
+
+
+def update_from_checkpoint_name(path):
+    match = re.search(r"(?:^|_)update_(\d+)", path.stem)
+    return int(match.group(1)) if match else 0
+
+
+def make_metrics_writer(log_dir, append=False):
     metrics_path = log_dir / "metrics.csv"
     fieldnames = [
         "update",
@@ -470,9 +527,22 @@ def make_metrics_writer(log_dir):
         "avg_recompute_batch_size",
         *ROLLOUT_METRIC_FIELDNAMES,
     ]
-    handle = open(metrics_path, "w", newline="", encoding="utf-8")
+    mode = "w"
+    write_header = True
+    if append and metrics_path.exists():
+        with open(metrics_path, newline="", encoding="utf-8") as existing:
+            existing_header = next(csv.reader(existing), [])
+        if existing_header == fieldnames:
+            mode = "a"
+            write_header = False
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            metrics_path = log_dir / f"metrics_resume_{timestamp}.csv"
+
+    handle = open(metrics_path, mode, newline="", encoding="utf-8")
     writer = csv.DictWriter(handle, fieldnames=fieldnames)
-    writer.writeheader()
+    if write_header:
+        writer.writeheader()
     handle.flush()
     return handle, writer, metrics_path
 
@@ -486,7 +556,7 @@ def save_best_checkpoint(agent, checkpoint_dir, update, eval_reward, best_checkp
         return best_checkpoints
 
     checkpoint_path = checkpoint_dir / f"best_update_{update:04d}_reward_{eval_reward:.3f}.pt"
-    agent.save(checkpoint_path)
+    agent.save(checkpoint_path, update=update, eval_reward=eval_reward)
     best_checkpoints.append((eval_reward, checkpoint_path))
     best_checkpoints.sort(key=lambda item: item[0], reverse=True)
 
@@ -506,12 +576,16 @@ def main():
     args.device = str(resolve_device(args.device, strict=args.strict_device))
 
     run_name, run_dir, log_dir, checkpoint_path = create_run_paths(args)
-    write_config(log_dir, args, run_name, checkpoint_path)
-    metrics_handle, metrics_writer, metrics_path = make_metrics_writer(log_dir)
+    resume_path = Path(args.resume_from) if args.resume_from else (checkpoint_path if args.resume else None)
+    write_config(log_dir, args, run_name, checkpoint_path, resume_path=resume_path)
+    previous_metrics_update, previous_eval_reward = read_last_metrics_update(log_dir / "metrics.csv")
+    metrics_handle, metrics_writer, metrics_path = make_metrics_writer(log_dir, append=resume_path is not None)
     print(f"run_name={run_name}")
     print(f"run_dir={run_dir}")
     print(f"metrics_log={metrics_path}")
     print(f"checkpoint={checkpoint_path}")
+    if resume_path is not None:
+        print(f"resume_from={resume_path}")
     print(f"device={args.device}")
 
     env_args = (args.height, args.width, args.objects, args.agents)
@@ -529,7 +603,16 @@ def main():
         entropy_coef=args.entropy_coef,
         ppo_epochs=args.ppo_epochs,
         max_plan_steps=args.max_plan_steps,
+        repeated_sync_penalty=args.repeated_sync_penalty,
+        free_syncs_after_object=args.free_syncs_after_object,
     )
+
+    loaded_checkpoint = None
+    if resume_path is not None:
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint does not exist: {resume_path}")
+        loaded_checkpoint = agent.load(resume_path, load_optimizer=True)
+        print(f"loaded_checkpoint={resume_path}")
 
     baseline = evaluate_agent(env_args, RandomAgent(), args.eval_episodes)
     print(
@@ -538,7 +621,18 @@ def main():
         f"avg_length={baseline['avg_length']:.1f}"
     )
 
-    last_eval_reward = None
+    checkpoint_update = int(loaded_checkpoint.get("update", 0)) if loaded_checkpoint else 0
+    checkpoint_name_update = update_from_checkpoint_name(resume_path) if resume_path is not None else 0
+    if checkpoint_update > 0:
+        completed_updates = checkpoint_update
+    elif checkpoint_name_update > 0:
+        completed_updates = checkpoint_name_update
+    else:
+        completed_updates = previous_metrics_update if resume_path is not None else 0
+    start_update = completed_updates + 1
+    end_update = completed_updates + args.updates
+    args.end_update = end_update
+    last_eval_reward = previous_eval_reward
     best_checkpoints = []
     checkpoint_dir = checkpoint_path.parent
     total_episodes = args.updates * args.episodes_per_update
@@ -562,7 +656,7 @@ def main():
         )
 
     try:
-        for update in range(1, args.updates + 1):
+        for update in range(start_update, end_update + 1):
             update_start = time.perf_counter()
             agent.rollout_buffer.clear()
             rollout_start = time.perf_counter()
@@ -586,7 +680,7 @@ def main():
                 )
             rollout_sec = time.perf_counter() - rollout_start
 
-            progress.set_description(f"training PPO update {update}/{args.updates}")
+            progress.set_description(f"training PPO update {update}/{end_update}")
             ppo_start = time.perf_counter()
             stats = agent.train_update()
             stats.update(finalize_rollout_metrics(rollout_metric_counts))
@@ -599,7 +693,7 @@ def main():
             checkpoint_sec = 0.0
             eval_stats = None
             progress.set_postfix(
-                update=f"{update}/{args.updates}",
+                update=f"{update}/{end_update}",
                 reward=f"{avg_reward:.2f}",
                 length=f"{avg_length:.1f}",
                 macros=f"{avg_macros:.1f}",
@@ -618,15 +712,15 @@ def main():
                     f"loss={stats.get('loss', 0.0):.4f}"
                 )
 
-            if update % args.eval_every == 0 or update == args.updates:
-                progress.set_description(f"evaluating update {update}/{args.updates}")
+            if update % args.eval_every == 0 or update == end_update:
+                progress.set_description(f"evaluating update {update}/{end_update}")
                 eval_start = time.perf_counter()
                 eval_stats = evaluate_agent(env_args, agent, args.eval_episodes)
                 eval_sec = time.perf_counter() - eval_start
                 last_eval_reward = eval_stats["avg_reward"]
                 progress.set_description("training PPO")
                 progress.set_postfix(
-                    update=f"{update}/{args.updates}",
+                    update=f"{update}/{end_update}",
                     reward=f"{avg_reward:.2f}",
                     length=f"{avg_length:.1f}",
                     macros=f"{avg_macros:.1f}",
@@ -641,7 +735,7 @@ def main():
                     f"avg_macros={eval_stats['avg_macros']:.1f}"
                 )
                 checkpoint_start = time.perf_counter()
-                agent.save(checkpoint_path)
+                agent.save(checkpoint_path, update=update, eval_reward=eval_stats["avg_reward"])
                 best_checkpoints = save_best_checkpoint(
                     agent,
                     checkpoint_dir,

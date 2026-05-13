@@ -54,6 +54,9 @@ def parse_args():
     parser.add_argument("--objects", type=int, default=10)
     parser.add_argument("--agents", type=int, default=5)
     parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--max-plan-steps", type=int, default=None)
+    parser.add_argument("--repeated-sync-penalty", type=float, default=0.0)
+    parser.add_argument("--free-syncs-after-object", type=int, default=1)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--candidates", type=int, default=1, help="Run N deterministic episodes and render the best reward.")
@@ -72,6 +75,9 @@ def main():
         h=args.height,
         agents=args.agents,
         hidden_dim=args.hidden_dim,
+        max_plan_steps=args.max_plan_steps,
+        repeated_sync_penalty=args.repeated_sync_penalty,
+        free_syncs_after_object=args.free_syncs_after_object,
         device=args.device,
     )
     agent.load(args.checkpoint, load_optimizer=False)
