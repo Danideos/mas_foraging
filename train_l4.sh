@@ -43,29 +43,21 @@ print("cuda:", torch.version.cuda)
 print("gpu:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none")
 PY
 
-python -m ppo_assignment.train \
-  --run-name ppo_5x5_5a_l4_sync \
-  --runs-dir runs \
-  --width 5 \
-  --height 5 \
-  --objects 10 \
-  --agents 5 \
-  --updates 1000 \
-  --episodes-per-update 64 \
-  --eval-every 25 \
-  --eval-episodes 20 \
-  --hidden-dim 128 \
-  --ppo-epochs 2 \
-  --lr 0.00025 \
-  --gamma 0.99 \
-  --gae-lambda 0.95 \
-  --clip-eps 0.15 \
-  --value-coef 0.5 \
-  --entropy-coef 0.015 \
-  --max-plan-steps 20 \
-  --device cuda \
-  --workers 64 \
-  --worker-chunk-size 0 \
-  --worker-torch-threads 1 \
-  --keep-best-checkpoints 5 \
-  --strict-device
+python -m ppo_assignment.train `
+  --run-name ppo_5x5_5a_new `
+  --runs-dir runs ` 
+  --updates 3000 `   
+  --width 5 --height 5 --objects 10 --agents 5 `
+  --episodes-per-update 64 `
+  --eval-every 25 --eval-episodes 20 `
+  --hidden-dim 128 --ppo-epochs 1 `
+  --lr 0.0001 --gamma 0.99 --gae-lambda 0.95 `
+  --clip-eps 0.05 --value-coef 1.0 --entropy-coef 0.001 `
+  --max-plan-steps 15 `
+  --device cuda `
+  --workers 8 --worker-chunk-size 0 --worker-torch-threads 1 `
+  --worker-transport plain `
+  --keep-best-checkpoints 5 `
+  --strict-device `
+  --repeated-sync-penalty 0.25
+  --eval-seed 12345

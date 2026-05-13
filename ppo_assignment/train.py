@@ -132,7 +132,18 @@ def finalize_rollout_metrics(counts):
     }
 
 
-def evaluate_agent(env_args, agent, episodes, deterministic=True):
+def evaluate_agent(env_args, agent, episodes, deterministic=True, seed=None):
+    random_state = None
+    torch_state = None
+    cuda_states = None
+    if seed is not None:
+        random_state = random.getstate()
+        torch_state = torch.random.get_rng_state()
+        if torch.cuda.is_available():
+            cuda_states = torch.cuda.get_rng_state_all()
+        random.seed(seed)
+        torch.manual_seed(seed)
+
     saved_transitions = None
     if hasattr(agent, "rollout_buffer"):
         saved_transitions = list(agent.rollout_buffer.transitions)
@@ -158,6 +169,11 @@ def evaluate_agent(env_args, agent, episodes, deterministic=True):
     finally:
         if saved_transitions is not None:
             agent.rollout_buffer.transitions = saved_transitions
+        if seed is not None:
+            random.setstate(random_state)
+            torch.random.set_rng_state(torch_state)
+            if cuda_states is not None:
+                torch.cuda.set_rng_state_all(cuda_states)
 
     return {
         "avg_reward": sum(rewards) / len(rewards),
@@ -382,6 +398,12 @@ def parse_args():
     parser.add_argument("--episodes-per-update", type=int, default=16)
     parser.add_argument("--eval-every", type=int, default=25)
     parser.add_argument("--eval-episodes", type=int, default=10)
+    parser.add_argument(
+        "--eval-seed",
+        type=int,
+        default=None,
+        help="Seed used for evaluation episodes. Set this for a fixed held-out eval sequence across updates.",
+    )
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -614,7 +636,7 @@ def main():
         loaded_checkpoint = agent.load(resume_path, load_optimizer=True)
         print(f"loaded_checkpoint={resume_path}")
 
-    baseline = evaluate_agent(env_args, RandomAgent(), args.eval_episodes)
+    baseline = evaluate_agent(env_args, RandomAgent(), args.eval_episodes, seed=args.eval_seed)
     print(
         "random_baseline "
         f"avg_reward={baseline['avg_reward']:.3f} "
@@ -715,7 +737,7 @@ def main():
             if update % args.eval_every == 0 or update == end_update:
                 progress.set_description(f"evaluating update {update}/{end_update}")
                 eval_start = time.perf_counter()
-                eval_stats = evaluate_agent(env_args, agent, args.eval_episodes)
+                eval_stats = evaluate_agent(env_args, agent, args.eval_episodes, seed=args.eval_seed)
                 eval_sec = time.perf_counter() - eval_start
                 last_eval_reward = eval_stats["avg_reward"]
                 progress.set_description("training PPO")
