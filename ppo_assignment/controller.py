@@ -112,6 +112,37 @@ def all_agents_at_targets(agent_locations, active_plan):
     return all_agents_at_goals(agent_locations, active_plan)
 
 
+def all_agents_completed_macro_goals(agent_locations, active_plan, sync_bumped):
+    if not active_plan:
+        return False
+    if len(active_plan) != len(agent_locations):
+        return False
+
+    for agent_idx, agent_pos in enumerate(agent_locations):
+        if agent_idx not in active_plan:
+            return False
+        goal = active_plan[agent_idx]
+        if goal[0] == "sync":
+            if not sync_bumped.get(agent_idx, False):
+                return False
+        elif manhattan(agent_pos, goal) != 0:
+            return False
+    return True
+
+
+def outward_wall_bump_action(goal, h, w):
+    x, y = goal_position(goal)
+    if x == 0:
+        return NORTH
+    if x == h - 1:
+        return SOUTH
+    if y == 0:
+        return WEST
+    if y == w - 1:
+        return EAST
+    return random.randrange(0, 4)
+
+
 def move_towards(agent_pos, goal, h, w):
     ax, ay = agent_pos
     tx, ty = goal_position(goal)
@@ -125,15 +156,7 @@ def move_towards(agent_pos, goal, h, w):
     if ay > ty:
         return WEST
 
-    if ax == 0:
-        return NORTH
-    if ax == h - 1:
-        return SOUTH
-    if ay == 0:
-        return WEST
-    if ay == w - 1:
-        return EAST
-    return random.randrange(0, 4)
+    return outward_wall_bump_action(goal, h, w)
 
 
 def goals_to_actions(agent_locations, active_plan, h, w):

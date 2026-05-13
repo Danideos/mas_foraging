@@ -7,12 +7,14 @@ import torch
 from torch.distributions import Categorical
 
 from .controller import (
-    all_agents_at_goals,
+    all_agents_completed_macro_goals,
     candidate_goals_for_agent,
     critic_goals,
     extract_objects,
     object_goals,
     goals_to_actions,
+    manhattan,
+    outward_wall_bump_action,
 )
 from .device import resolve_device
 from .models import Actor, Critic
@@ -64,6 +66,8 @@ class AutoregressiveAssignmentPPOAgent:
         self.plan_duration = 0
         self.last_object_count = None
         self.current_macro = None
+        self.sync_bumped = {}
+        self.pending_sync_bump_agents = set()
 
     def action(self, state, deterministic=False):
         world_map, agent_locations = state
@@ -81,7 +85,7 @@ class AutoregressiveAssignmentPPOAgent:
         stuck = (
             self.active_plan is not None
             and current_object_count > 0
-            and all_agents_at_goals(agent_locations, self.active_plan)
+            and all_agents_completed_macro_goals(agent_locations, self.active_plan, self.sync_bumped)
         )
         need_decision = (
             self.active_plan is None
@@ -103,6 +107,12 @@ class AutoregressiveAssignmentPPOAgent:
                 value = self.critic(state, self.h, self.w, self.agents, goals)
 
             self.active_plan = active_plan
+            self.sync_bumped = {
+                agent_idx: False
+                for agent_idx, goal in active_plan.items()
+                if goal[0] == "sync"
+            }
+            self.pending_sync_bump_agents = set()
             self.current_macro = {
                 "decision_state": self.copy_state(state),
                 "agent_order": list(agent_order),
@@ -116,9 +126,29 @@ class AutoregressiveAssignmentPPOAgent:
             }
             self.plan_duration = 0
 
-        primitive_actions = goals_to_actions(agent_locations, self.active_plan, self.h, self.w)
+        primitive_actions = self.goals_to_primitive_actions(agent_locations)
         self.last_object_count = current_object_count
         return primitive_actions
+
+    def goals_to_primitive_actions(self, agent_locations):
+        actions = []
+        self.pending_sync_bump_agents.clear()
+        for agent_idx, agent_pos in enumerate(agent_locations):
+            goal = self.active_plan.get(agent_idx) if self.active_plan else None
+            if goal is None:
+                actions.append(random.randrange(0, 4))
+                continue
+
+            if (
+                goal[0] == "sync"
+                and not self.sync_bumped.get(agent_idx, False)
+                and manhattan(agent_pos, goal) == 0
+            ):
+                actions.append(outward_wall_bump_action(goal, self.h, self.w))
+                self.pending_sync_bump_agents.add(agent_idx)
+            else:
+                actions.append(goals_to_actions([agent_pos], {0: goal}, self.h, self.w)[0])
+        return actions
 
     def make_assignment_decision(self, state, deterministic=False):
         world_map, agent_locations = state
@@ -189,6 +219,11 @@ class AutoregressiveAssignmentPPOAgent:
         return targets, target_indices, agent_order, joint_logprob, joint_entropy
 
     def reward(self, reward):
+        for agent_idx in self.pending_sync_bump_agents:
+            if agent_idx in self.sync_bumped:
+                self.sync_bumped[agent_idx] = True
+        self.pending_sync_bump_agents.clear()
+
         if self.current_macro is not None:
             duration = self.current_macro["duration"]
             self.current_macro["macro_reward"] += (self.gamma ** duration) * float(reward)
@@ -200,6 +235,8 @@ class AutoregressiveAssignmentPPOAgent:
             self.close_current_macro(next_state=final_state, done=True)
         self.active_plan = None
         self.current_macro = None
+        self.sync_bumped = {}
+        self.pending_sync_bump_agents = set()
 
     def close_current_macro(self, next_state, done):
         macro = self.current_macro
