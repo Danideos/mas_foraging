@@ -333,12 +333,14 @@ import torch
 from torch.distributions import Categorical
 
 from .controller import (
-    all_agents_at_goals,
+    all_agents_completed_macro_goals,
     candidate_goals_for_agent,
     critic_goals,
     extract_objects,
     object_goals,
     goals_to_actions,
+    manhattan,
+    outward_wall_bump_action,
 )
 from .device import resolve_device
 from .models import Actor, Critic
@@ -382,14 +384,34 @@ class AutoregressiveAssignmentPPOAgent:
         )
 
         self.rollout_buffer = RolloutBuffer()
+        self.reset_rollout_metrics()
         self.reset_episode_state()
         self.last_update_stats = {}
+
+    def reset_rollout_metrics(self):
+        self.rollout_metrics = {
+            "sync_choice_count": 0,
+            "zero_distance_sync_choice_count": 0,
+            "goal_choice_count": 0,
+            "sync_bump_completed_count": 0,
+            "sync_reached_but_not_bumped_count": 0,
+            "decision_trigger_object_collected": 0,
+            "decision_trigger_goals_completed": 0,
+            "decision_trigger_max_plan_steps": 0,
+            "remaining_objects_at_episode_end_sum": 0,
+            "episode_end_count": 0,
+        }
+
+    def get_rollout_metrics(self):
+        return dict(self.rollout_metrics)
 
     def reset_episode_state(self):
         self.active_plan = None
         self.plan_duration = 0
         self.last_object_count = None
         self.current_macro = None
+        self.sync_bumped = {}
+        self.pending_sync_bump_agents = set()
 
     def action(self, state, deterministic=False):
         world_map, agent_locations = state
@@ -404,19 +426,27 @@ class AutoregressiveAssignmentPPOAgent:
             self.last_object_count is not None
             and current_object_count < self.last_object_count
         )
-        stuck = (
+        goals_completed = (
             self.active_plan is not None
             and current_object_count > 0
-            and all_agents_at_goals(agent_locations, self.active_plan)
+            and all_agents_completed_macro_goals(agent_locations, self.active_plan, self.sync_bumped)
         )
+        max_plan_steps_reached = self.active_plan is not None and self.plan_duration >= self.max_plan_steps
         need_decision = (
             self.active_plan is None
             or object_collected
-            or stuck
-            or self.plan_duration >= self.max_plan_steps
+            or goals_completed
+            or max_plan_steps_reached
         )
 
         if need_decision:
+            if object_collected:
+                self.rollout_metrics["decision_trigger_object_collected"] += 1
+            if goals_completed:
+                self.rollout_metrics["decision_trigger_goals_completed"] += 1
+            if max_plan_steps_reached:
+                self.rollout_metrics["decision_trigger_max_plan_steps"] += 1
+
             if self.current_macro is not None:
                 self.close_current_macro(next_state=state, done=False)
 
@@ -429,22 +459,55 @@ class AutoregressiveAssignmentPPOAgent:
                 value = self.critic(state, self.h, self.w, self.agents, goals)
 
             self.active_plan = active_plan
+            self.rollout_metrics["goal_choice_count"] += len(active_plan)
+            for agent_idx, goal in active_plan.items():
+                if goal[0] == "sync":
+                    self.rollout_metrics["sync_choice_count"] += 1
+                    if manhattan(agent_locations[agent_idx], goal) == 0:
+                        self.rollout_metrics["zero_distance_sync_choice_count"] += 1
+            self.sync_bumped = {
+                agent_idx: False
+                for agent_idx, goal in active_plan.items()
+                if goal[0] == "sync"
+            }
+            self.pending_sync_bump_agents = set()
             self.current_macro = {
                 "decision_state": self.copy_state(state),
                 "agent_order": list(agent_order),
                 "targets": copy.deepcopy(active_plan),
                 "target_indices": copy.deepcopy(target_indices),
-                "old_joint_logprob": joint_logprob.detach().clone(),
-                "old_value": value.detach().clone(),
-                "old_entropy": joint_entropy.detach().clone(),
+                "old_joint_logprob": float(joint_logprob.detach().cpu().item()),
+                "old_value": float(value.detach().cpu().item()),
+                "old_entropy": float(joint_entropy.detach().cpu().item()),
                 "macro_reward": 0.0,
                 "duration": 0,
             }
             self.plan_duration = 0
 
-        primitive_actions = goals_to_actions(agent_locations, self.active_plan, self.h, self.w)
+        primitive_actions = self.goals_to_primitive_actions(agent_locations)
         self.last_object_count = current_object_count
         return primitive_actions
+
+    def goals_to_primitive_actions(self, agent_locations):
+        actions = []
+        self.pending_sync_bump_agents.clear()
+        for agent_idx, agent_pos in enumerate(agent_locations):
+            goal = self.active_plan.get(agent_idx) if self.active_plan else None
+            if goal is None:
+                actions.append(random.randrange(0, 4))
+                continue
+
+            if (
+                goal[0] == "sync"
+                and not self.sync_bumped.get(agent_idx, False)
+                and manhattan(agent_pos, goal) == 0
+            ):
+                actions.append(outward_wall_bump_action(goal, self.h, self.w))
+                self.pending_sync_bump_agents.add(agent_idx)
+                self.rollout_metrics["sync_reached_but_not_bumped_count"] += 1
+            else:
+                actions.append(goals_to_actions([agent_pos], {0: goal}, self.h, self.w)[0])
+        return actions
 
     def make_assignment_decision(self, state, deterministic=False):
         world_map, agent_locations = state
@@ -515,6 +578,12 @@ class AutoregressiveAssignmentPPOAgent:
         return targets, target_indices, agent_order, joint_logprob, joint_entropy
 
     def reward(self, reward):
+        for agent_idx in self.pending_sync_bump_agents:
+            if agent_idx in self.sync_bumped and not self.sync_bumped[agent_idx]:
+                self.sync_bumped[agent_idx] = True
+                self.rollout_metrics["sync_bump_completed_count"] += 1
+        self.pending_sync_bump_agents.clear()
+
         if self.current_macro is not None:
             duration = self.current_macro["duration"]
             self.current_macro["macro_reward"] += (self.gamma ** duration) * float(reward)
@@ -524,8 +593,12 @@ class AutoregressiveAssignmentPPOAgent:
     def finish_episode(self, final_state):
         if self.current_macro is not None:
             self.close_current_macro(next_state=final_state, done=True)
+        self.rollout_metrics["remaining_objects_at_episode_end_sum"] += len(extract_objects(final_state[0]))
+        self.rollout_metrics["episode_end_count"] += 1
         self.active_plan = None
         self.current_macro = None
+        self.sync_bumped = {}
+        self.pending_sync_bump_agents = set()
 
     def close_current_macro(self, next_state, done):
         macro = self.current_macro
@@ -776,7 +849,16 @@ class AutoregressiveAssignmentPPOAgent:
                 dtype=torch.float32,
                 device=self.device,
             )
-            old_values = torch.stack([transition.old_value.to(self.device) for transition in transitions])
+            old_values = torch.tensor(
+                [
+                    float(transition.old_value)
+                    if not isinstance(transition.old_value, torch.Tensor)
+                    else float(transition.old_value.detach().cpu().item())
+                    for transition in transitions
+                ],
+                dtype=torch.float32,
+                device=self.device,
+            )
             target_tensor = (
                 macro_rewards + torch.pow(torch.tensor(self.gamma, dtype=torch.float32, device=self.device), durations) * next_values * not_done
             ).detach()
@@ -792,7 +874,16 @@ class AutoregressiveAssignmentPPOAgent:
             critic_start = time.perf_counter()
             new_value_tensor = self.critic_values_batch([transition.decision_state for transition in transitions])
             critic_value_sec += time.perf_counter() - critic_start
-            old_logprob_tensor = torch.stack([transition.old_joint_logprob.to(self.device) for transition in transitions]).detach()
+            old_logprob_tensor = torch.tensor(
+                [
+                    float(transition.old_joint_logprob)
+                    if not isinstance(transition.old_joint_logprob, torch.Tensor)
+                    else float(transition.old_joint_logprob.detach().cpu().item())
+                    for transition in transitions
+                ],
+                dtype=torch.float32,
+                device=self.device,
+            )
 
             ratio = torch.exp(new_logprob_tensor - old_logprob_tensor)
             unclipped = ratio * advantage_tensor
@@ -984,6 +1075,37 @@ def all_agents_at_targets(agent_locations, active_plan):
     return all_agents_at_goals(agent_locations, active_plan)
 
 
+def all_agents_completed_macro_goals(agent_locations, active_plan, sync_bumped):
+    if not active_plan:
+        return False
+    if len(active_plan) != len(agent_locations):
+        return False
+
+    for agent_idx, agent_pos in enumerate(agent_locations):
+        if agent_idx not in active_plan:
+            return False
+        goal = active_plan[agent_idx]
+        if goal[0] == "sync":
+            if not sync_bumped.get(agent_idx, False):
+                return False
+        elif manhattan(agent_pos, goal) != 0:
+            return False
+    return True
+
+
+def outward_wall_bump_action(goal, h, w):
+    x, y = goal_position(goal)
+    if x == 0:
+        return NORTH
+    if x == h - 1:
+        return SOUTH
+    if y == 0:
+        return WEST
+    if y == w - 1:
+        return EAST
+    return random.randrange(0, 4)
+
+
 def move_towards(agent_pos, goal, h, w):
     ax, ay = agent_pos
     tx, ty = goal_position(goal)
@@ -997,15 +1119,7 @@ def move_towards(agent_pos, goal, h, w):
     if ay > ty:
         return WEST
 
-    if ax == 0:
-        return NORTH
-    if ax == h - 1:
-        return SOUTH
-    if ay == 0:
-        return WEST
-    if ay == w - 1:
-        return EAST
-    return random.randrange(0, 4)
+    return outward_wall_bump_action(goal, h, w)
 
 
 def goals_to_actions(agent_locations, active_plan, h, w):
@@ -1524,6 +1638,7 @@ class RolloutBuffer:
 
 ```py
 import argparse
+import copy
 import csv
 import json
 import os
@@ -1541,9 +1656,11 @@ if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
     from ppo_assignment.agent import AutoregressiveAssignmentPPOAgent
     from ppo_assignment.device import resolve_device
+    from ppo_assignment.rollout import MacroTransition
 else:
     from .agent import AutoregressiveAssignmentPPOAgent
     from .device import resolve_device
+    from .rollout import MacroTransition
 
 try:
     from foraging.foraging import ForagingEnvironment
@@ -1554,6 +1671,32 @@ except ModuleNotFoundError:
 
 _WORKER_ENV_ARGS = None
 _WORKER_AGENT = None
+
+
+ROLLOUT_METRIC_COUNT_KEYS = [
+    "sync_choice_count",
+    "zero_distance_sync_choice_count",
+    "goal_choice_count",
+    "sync_bump_completed_count",
+    "sync_reached_but_not_bumped_count",
+    "decision_trigger_object_collected",
+    "decision_trigger_goals_completed",
+    "decision_trigger_max_plan_steps",
+    "remaining_objects_at_episode_end_sum",
+    "episode_end_count",
+]
+
+
+ROLLOUT_METRIC_FIELDNAMES = [
+    "sync_choice_rate",
+    "zero_distance_sync_choice_rate",
+    "sync_bump_completed_count",
+    "sync_reached_but_not_bumped_count",
+    "decision_trigger_object_collected",
+    "decision_trigger_goals_completed",
+    "decision_trigger_max_plan_steps",
+    "remaining_objects_at_episode_end",
+]
 
 
 class RandomAgent:
@@ -1595,6 +1738,36 @@ def run_episode(env, agent, deterministic=False, train=True):
     end_macros = len(agent.rollout_buffer) if hasattr(agent, "rollout_buffer") else start_macros
     macro_count = max(end_macros - start_macros, 0)
     return total_reward, steps, macro_count
+
+
+def empty_rollout_metric_counts():
+    return {key: 0 for key in ROLLOUT_METRIC_COUNT_KEYS}
+
+
+def add_rollout_metric_counts(total, chunk):
+    for key in ROLLOUT_METRIC_COUNT_KEYS:
+        total[key] = total.get(key, 0) + chunk.get(key, 0)
+    return total
+
+
+def finalize_rollout_metrics(counts):
+    goal_choices = counts.get("goal_choice_count", 0)
+    sync_choices = counts.get("sync_choice_count", 0)
+    episode_count = counts.get("episode_end_count", 0)
+    return {
+        "sync_choice_rate": 0.0 if goal_choices == 0 else counts.get("sync_choice_count", 0) / goal_choices,
+        "zero_distance_sync_choice_rate": 0.0
+        if sync_choices == 0
+        else counts.get("zero_distance_sync_choice_count", 0) / sync_choices,
+        "sync_bump_completed_count": counts.get("sync_bump_completed_count", 0),
+        "sync_reached_but_not_bumped_count": counts.get("sync_reached_but_not_bumped_count", 0),
+        "decision_trigger_object_collected": counts.get("decision_trigger_object_collected", 0),
+        "decision_trigger_goals_completed": counts.get("decision_trigger_goals_completed", 0),
+        "decision_trigger_max_plan_steps": counts.get("decision_trigger_max_plan_steps", 0),
+        "remaining_objects_at_episode_end": 0.0
+        if episode_count == 0
+        else counts.get("remaining_objects_at_episode_end_sum", 0) / episode_count,
+    }
 
 
 def evaluate_agent(env_args, agent, episodes, deterministic=True):
@@ -1664,7 +1837,47 @@ def init_rollout_worker(env_args, agent_kwargs, torch_threads):
     _WORKER_AGENT = AutoregressiveAssignmentPPOAgent(**agent_kwargs)
 
 
-def rollout_worker(actor_state, critic_state, seed, episodes):
+def tensor_to_plain(x):
+    if isinstance(x, torch.Tensor):
+        if x.numel() == 1:
+            return float(x.detach().cpu().item())
+        return x.detach().cpu().tolist()
+    return x
+
+
+def transition_to_plain(t):
+    return {
+        "decision_state": copy.deepcopy(t.decision_state),
+        "agent_order": list(t.agent_order),
+        "targets": copy.deepcopy(t.targets),
+        "target_indices": copy.deepcopy(t.target_indices),
+        "old_joint_logprob": tensor_to_plain(t.old_joint_logprob),
+        "old_value": tensor_to_plain(t.old_value),
+        "old_entropy": tensor_to_plain(t.old_entropy),
+        "macro_reward": float(t.macro_reward),
+        "duration": int(t.duration),
+        "next_decision_state": copy.deepcopy(t.next_decision_state),
+        "done": bool(t.done),
+    }
+
+
+def transition_from_plain(d):
+    return MacroTransition(
+        decision_state=d["decision_state"],
+        agent_order=d["agent_order"],
+        targets=d["targets"],
+        target_indices=d["target_indices"],
+        old_joint_logprob=float(d["old_joint_logprob"]),
+        old_value=float(d["old_value"]),
+        old_entropy=float(d["old_entropy"]),
+        macro_reward=float(d["macro_reward"]),
+        duration=int(d["duration"]),
+        next_decision_state=d["next_decision_state"],
+        done=bool(d["done"]),
+    )
+
+
+def rollout_worker(actor_state, critic_state, seed, episodes, worker_transport):
     random.seed(seed)
     torch.manual_seed(seed)
 
@@ -1674,6 +1887,7 @@ def rollout_worker(actor_state, critic_state, seed, episodes):
     _WORKER_AGENT.actor.load_state_dict(actor_state)
     _WORKER_AGENT.critic.load_state_dict(critic_state)
     _WORKER_AGENT.rollout_buffer.clear()
+    _WORKER_AGENT.reset_rollout_metrics()
 
     rewards = []
     lengths = []
@@ -1686,7 +1900,9 @@ def rollout_worker(actor_state, critic_state, seed, episodes):
         macros.append(macro_count)
 
     transitions = list(_WORKER_AGENT.rollout_buffer.transitions)
-    return rewards, lengths, macros, transitions
+    if worker_transport == "plain":
+        transitions = [transition_to_plain(transition) for transition in transitions]
+    return rewards, lengths, macros, transitions, _WORKER_AGENT.get_rollout_metrics()
 
 
 def episode_chunks(total_episodes, workers, requested_chunk_size):
@@ -1704,6 +1920,7 @@ def episode_chunks(total_episodes, workers, requested_chunk_size):
 
 
 def collect_rollouts_serial(env_args, agent, args, progress, update, last_eval_reward):
+    agent.reset_rollout_metrics()
     rewards = []
     lengths = []
     macros = []
@@ -1723,7 +1940,7 @@ def collect_rollouts_serial(env_args, agent, args, progress, update, last_eval_r
             workers=1,
             eval="-" if last_eval_reward is None else f"{last_eval_reward:.2f}",
         )
-    return rewards, lengths, macros
+    return rewards, lengths, macros, agent.get_rollout_metrics()
 
 
 def collect_rollouts_parallel(agent, args, progress, update, last_eval_reward, executor):
@@ -1734,6 +1951,7 @@ def collect_rollouts_parallel(agent, args, progress, update, last_eval_reward, e
     rewards = []
     lengths = []
     macros = []
+    rollout_metric_counts = empty_rollout_metric_counts()
     completed = 0
     next_chunk_idx = 0
     pending = set()
@@ -1751,6 +1969,7 @@ def collect_rollouts_parallel(agent, args, progress, update, last_eval_reward, e
                 critic_state,
                 args.seed + update * 100_000 + chunk_idx * 1_003,
                 chunks[chunk_idx],
+                args.worker_transport,
             )
         )
 
@@ -1760,8 +1979,11 @@ def collect_rollouts_parallel(agent, args, progress, update, last_eval_reward, e
     while pending:
         done, pending = wait(pending, return_when=FIRST_COMPLETED)
         for future in done:
-            chunk_rewards, chunk_lengths, chunk_macros, chunk_transitions = future.result()
+            chunk_rewards, chunk_lengths, chunk_macros, chunk_transitions, chunk_metrics = future.result()
+            if args.worker_transport == "plain":
+                chunk_transitions = [transition_from_plain(transition) for transition in chunk_transitions]
             agent.rollout_buffer.transitions.extend(chunk_transitions)
+            add_rollout_metric_counts(rollout_metric_counts, chunk_metrics)
             rewards.extend(chunk_rewards)
             lengths.extend(chunk_lengths)
             macros.extend(chunk_macros)
@@ -1779,7 +2001,7 @@ def collect_rollouts_parallel(agent, args, progress, update, last_eval_reward, e
             )
             submit_next_chunk()
 
-    return rewards, lengths, macros
+    return rewards, lengths, macros, rollout_metric_counts
 
 
 def parse_args():
@@ -1812,6 +2034,12 @@ def parse_args():
     parser.add_argument("--workers", type=int, default=1, help="Parallel CPU rollout workers. Use 1 for serial rollouts.")
     parser.add_argument("--worker-chunk-size", type=int, default=0, help="Episodes per worker task. 0 uses dynamic one-episode tasks.")
     parser.add_argument("--worker-torch-threads", type=int, default=1, help="Torch intra-op threads per rollout worker.")
+    parser.add_argument(
+        "--worker-transport",
+        choices=["torch", "plain"],
+        default="plain",
+        help="How rollout workers return transitions. 'plain' converts tensors to Python floats/lists to avoid torch multiprocessing shared-memory mmap issues.",
+    )
     parser.add_argument("--strict-device", action="store_true", help="Fail instead of falling back when the requested device is unavailable.")
     return parser.parse_args()
 
@@ -1879,6 +2107,7 @@ def make_metrics_writer(log_dir):
         "max_candidate_count",
         "recompute_batches",
         "avg_recompute_batch_size",
+        *ROLLOUT_METRIC_FIELDNAMES,
     ]
     handle = open(metrics_path, "w", newline="", encoding="utf-8")
     writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -1977,7 +2206,7 @@ def main():
             agent.rollout_buffer.clear()
             rollout_start = time.perf_counter()
             if args.workers > 1:
-                rewards, lengths, macros = collect_rollouts_parallel(
+                rewards, lengths, macros, rollout_metric_counts = collect_rollouts_parallel(
                     agent,
                     args,
                     progress,
@@ -1986,7 +2215,7 @@ def main():
                     rollout_executor,
                 )
             else:
-                rewards, lengths, macros = collect_rollouts_serial(
+                rewards, lengths, macros, rollout_metric_counts = collect_rollouts_serial(
                     env_args,
                     agent,
                     args,
@@ -1999,6 +2228,7 @@ def main():
             progress.set_description(f"training PPO update {update}/{args.updates}")
             ppo_start = time.perf_counter()
             stats = agent.train_update()
+            stats.update(finalize_rollout_metrics(rollout_metric_counts))
             ppo_sec = time.perf_counter() - ppo_start
             avg_reward = sum(rewards) / len(rewards)
             avg_length = sum(lengths) / len(lengths)
@@ -2099,6 +2329,14 @@ def main():
                     "max_candidate_count": stats.get("max_candidate_count", 0),
                     "recompute_batches": stats.get("recompute_batches", 0),
                     "avg_recompute_batch_size": stats.get("avg_recompute_batch_size", 0.0),
+                    "sync_choice_rate": stats.get("sync_choice_rate", 0.0),
+                    "zero_distance_sync_choice_rate": stats.get("zero_distance_sync_choice_rate", 0.0),
+                    "sync_bump_completed_count": stats.get("sync_bump_completed_count", 0),
+                    "sync_reached_but_not_bumped_count": stats.get("sync_reached_but_not_bumped_count", 0),
+                    "decision_trigger_object_collected": stats.get("decision_trigger_object_collected", 0),
+                    "decision_trigger_goals_completed": stats.get("decision_trigger_goals_completed", 0),
+                    "decision_trigger_max_plan_steps": stats.get("decision_trigger_max_plan_steps", 0),
+                    "remaining_objects_at_episode_end": stats.get("remaining_objects_at_episode_end", 0.0),
                 }
             )
             metrics_handle.flush()
@@ -2241,19 +2479,20 @@ torch
 #SBATCH --time=12:00:00
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=48G
-#SBATCH --output=/scratch/tmp/kaiserd/mas_foraging_logs/foraging_ppo_%j.out
-#SBATCH --error=/scratch/tmp/kaiserd/mas_foraging_logs/foraging_ppo_%j.err
+#SBATCH --output=/home/kaiserd/mas_foraging/logs/foraging_ppo_%j.out
+#SBATCH --error=/home/kaiserd/mas_foraging/logs/foraging_ppo_%j.err
 #SBATCH --open-mode=append
 
 set -euo pipefail
 
-cd /home/$USER/mas_foraging
-
 SCRATCH_BASE=/scratch/tmp/$USER
 VENV_DIR="$SCRATCH_BASE/mas_foraging_venv"
-LOG_DIR="$SCRATCH_BASE/mas_foraging_logs"
 
-mkdir -p "$LOG_DIR"
+HOME_BASE=/home/kaiserd/$USER/mas_foraging
+LOG_DIR="$HOME_BASE/mas_foraging_logs"
+
+cd $HOME_BASE
+
 mkdir -p logs runs
 
 export OMP_NUM_THREADS=1

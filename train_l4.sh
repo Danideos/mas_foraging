@@ -5,19 +5,20 @@
 #SBATCH --time=12:00:00
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=48G
-#SBATCH --output=/scratch/tmp/kaiserd/mas_foraging_logs/foraging_ppo_%j.out
-#SBATCH --error=/scratch/tmp/kaiserd/mas_foraging_logs/foraging_ppo_%j.err
+#SBATCH --output=/home/kaiserd/mas_foraging/logs/foraging_ppo_%j.out
+#SBATCH --error=/home/kaiserd/mas_foraging/logs/foraging_ppo_%j.err
 #SBATCH --open-mode=append
 
 set -euo pipefail
 
-cd /home/$USER/mas_foraging
-
 SCRATCH_BASE=/scratch/tmp/$USER
 VENV_DIR="$SCRATCH_BASE/mas_foraging_venv"
-LOG_DIR="$SCRATCH_BASE/mas_foraging_logs"
 
-mkdir -p "$LOG_DIR"
+HOME_BASE=/home/kaiserd/$USER/mas_foraging
+LOG_DIR="$HOME_BASE/mas_foraging_logs"
+
+cd $HOME_BASE
+
 mkdir -p logs runs
 
 export OMP_NUM_THREADS=1

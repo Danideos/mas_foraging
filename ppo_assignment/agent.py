@@ -58,8 +58,26 @@ class AutoregressiveAssignmentPPOAgent:
         )
 
         self.rollout_buffer = RolloutBuffer()
+        self.reset_rollout_metrics()
         self.reset_episode_state()
         self.last_update_stats = {}
+
+    def reset_rollout_metrics(self):
+        self.rollout_metrics = {
+            "sync_choice_count": 0,
+            "zero_distance_sync_choice_count": 0,
+            "goal_choice_count": 0,
+            "sync_bump_completed_count": 0,
+            "sync_reached_but_not_bumped_count": 0,
+            "decision_trigger_object_collected": 0,
+            "decision_trigger_goals_completed": 0,
+            "decision_trigger_max_plan_steps": 0,
+            "remaining_objects_at_episode_end_sum": 0,
+            "episode_end_count": 0,
+        }
+
+    def get_rollout_metrics(self):
+        return dict(self.rollout_metrics)
 
     def reset_episode_state(self):
         self.active_plan = None
@@ -82,19 +100,27 @@ class AutoregressiveAssignmentPPOAgent:
             self.last_object_count is not None
             and current_object_count < self.last_object_count
         )
-        stuck = (
+        goals_completed = (
             self.active_plan is not None
             and current_object_count > 0
             and all_agents_completed_macro_goals(agent_locations, self.active_plan, self.sync_bumped)
         )
+        max_plan_steps_reached = self.active_plan is not None and self.plan_duration >= self.max_plan_steps
         need_decision = (
             self.active_plan is None
             or object_collected
-            or stuck
-            or self.plan_duration >= self.max_plan_steps
+            or goals_completed
+            or max_plan_steps_reached
         )
 
         if need_decision:
+            if object_collected:
+                self.rollout_metrics["decision_trigger_object_collected"] += 1
+            if goals_completed:
+                self.rollout_metrics["decision_trigger_goals_completed"] += 1
+            if max_plan_steps_reached:
+                self.rollout_metrics["decision_trigger_max_plan_steps"] += 1
+
             if self.current_macro is not None:
                 self.close_current_macro(next_state=state, done=False)
 
@@ -107,6 +133,12 @@ class AutoregressiveAssignmentPPOAgent:
                 value = self.critic(state, self.h, self.w, self.agents, goals)
 
             self.active_plan = active_plan
+            self.rollout_metrics["goal_choice_count"] += len(active_plan)
+            for agent_idx, goal in active_plan.items():
+                if goal[0] == "sync":
+                    self.rollout_metrics["sync_choice_count"] += 1
+                    if manhattan(agent_locations[agent_idx], goal) == 0:
+                        self.rollout_metrics["zero_distance_sync_choice_count"] += 1
             self.sync_bumped = {
                 agent_idx: False
                 for agent_idx, goal in active_plan.items()
@@ -118,9 +150,9 @@ class AutoregressiveAssignmentPPOAgent:
                 "agent_order": list(agent_order),
                 "targets": copy.deepcopy(active_plan),
                 "target_indices": copy.deepcopy(target_indices),
-                "old_joint_logprob": joint_logprob.detach().clone(),
-                "old_value": value.detach().clone(),
-                "old_entropy": joint_entropy.detach().clone(),
+                "old_joint_logprob": float(joint_logprob.detach().cpu().item()),
+                "old_value": float(value.detach().cpu().item()),
+                "old_entropy": float(joint_entropy.detach().cpu().item()),
                 "macro_reward": 0.0,
                 "duration": 0,
             }
@@ -146,6 +178,7 @@ class AutoregressiveAssignmentPPOAgent:
             ):
                 actions.append(outward_wall_bump_action(goal, self.h, self.w))
                 self.pending_sync_bump_agents.add(agent_idx)
+                self.rollout_metrics["sync_reached_but_not_bumped_count"] += 1
             else:
                 actions.append(goals_to_actions([agent_pos], {0: goal}, self.h, self.w)[0])
         return actions
@@ -220,8 +253,9 @@ class AutoregressiveAssignmentPPOAgent:
 
     def reward(self, reward):
         for agent_idx in self.pending_sync_bump_agents:
-            if agent_idx in self.sync_bumped:
+            if agent_idx in self.sync_bumped and not self.sync_bumped[agent_idx]:
                 self.sync_bumped[agent_idx] = True
+                self.rollout_metrics["sync_bump_completed_count"] += 1
         self.pending_sync_bump_agents.clear()
 
         if self.current_macro is not None:
@@ -233,6 +267,8 @@ class AutoregressiveAssignmentPPOAgent:
     def finish_episode(self, final_state):
         if self.current_macro is not None:
             self.close_current_macro(next_state=final_state, done=True)
+        self.rollout_metrics["remaining_objects_at_episode_end_sum"] += len(extract_objects(final_state[0]))
+        self.rollout_metrics["episode_end_count"] += 1
         self.active_plan = None
         self.current_macro = None
         self.sync_bumped = {}
@@ -487,7 +523,16 @@ class AutoregressiveAssignmentPPOAgent:
                 dtype=torch.float32,
                 device=self.device,
             )
-            old_values = torch.stack([transition.old_value.to(self.device) for transition in transitions])
+            old_values = torch.tensor(
+                [
+                    float(transition.old_value)
+                    if not isinstance(transition.old_value, torch.Tensor)
+                    else float(transition.old_value.detach().cpu().item())
+                    for transition in transitions
+                ],
+                dtype=torch.float32,
+                device=self.device,
+            )
             target_tensor = (
                 macro_rewards + torch.pow(torch.tensor(self.gamma, dtype=torch.float32, device=self.device), durations) * next_values * not_done
             ).detach()
@@ -503,7 +548,16 @@ class AutoregressiveAssignmentPPOAgent:
             critic_start = time.perf_counter()
             new_value_tensor = self.critic_values_batch([transition.decision_state for transition in transitions])
             critic_value_sec += time.perf_counter() - critic_start
-            old_logprob_tensor = torch.stack([transition.old_joint_logprob.to(self.device) for transition in transitions]).detach()
+            old_logprob_tensor = torch.tensor(
+                [
+                    float(transition.old_joint_logprob)
+                    if not isinstance(transition.old_joint_logprob, torch.Tensor)
+                    else float(transition.old_joint_logprob.detach().cpu().item())
+                    for transition in transitions
+                ],
+                dtype=torch.float32,
+                device=self.device,
+            )
 
             ratio = torch.exp(new_logprob_tensor - old_logprob_tensor)
             unclipped = ratio * advantage_tensor

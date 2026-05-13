@@ -1,4 +1,5 @@
 import argparse
+import copy
 import csv
 import json
 import os
@@ -16,9 +17,11 @@ if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
     from ppo_assignment.agent import AutoregressiveAssignmentPPOAgent
     from ppo_assignment.device import resolve_device
+    from ppo_assignment.rollout import MacroTransition
 else:
     from .agent import AutoregressiveAssignmentPPOAgent
     from .device import resolve_device
+    from .rollout import MacroTransition
 
 try:
     from foraging.foraging import ForagingEnvironment
@@ -29,6 +32,32 @@ except ModuleNotFoundError:
 
 _WORKER_ENV_ARGS = None
 _WORKER_AGENT = None
+
+
+ROLLOUT_METRIC_COUNT_KEYS = [
+    "sync_choice_count",
+    "zero_distance_sync_choice_count",
+    "goal_choice_count",
+    "sync_bump_completed_count",
+    "sync_reached_but_not_bumped_count",
+    "decision_trigger_object_collected",
+    "decision_trigger_goals_completed",
+    "decision_trigger_max_plan_steps",
+    "remaining_objects_at_episode_end_sum",
+    "episode_end_count",
+]
+
+
+ROLLOUT_METRIC_FIELDNAMES = [
+    "sync_choice_rate",
+    "zero_distance_sync_choice_rate",
+    "sync_bump_completed_count",
+    "sync_reached_but_not_bumped_count",
+    "decision_trigger_object_collected",
+    "decision_trigger_goals_completed",
+    "decision_trigger_max_plan_steps",
+    "remaining_objects_at_episode_end",
+]
 
 
 class RandomAgent:
@@ -70,6 +99,36 @@ def run_episode(env, agent, deterministic=False, train=True):
     end_macros = len(agent.rollout_buffer) if hasattr(agent, "rollout_buffer") else start_macros
     macro_count = max(end_macros - start_macros, 0)
     return total_reward, steps, macro_count
+
+
+def empty_rollout_metric_counts():
+    return {key: 0 for key in ROLLOUT_METRIC_COUNT_KEYS}
+
+
+def add_rollout_metric_counts(total, chunk):
+    for key in ROLLOUT_METRIC_COUNT_KEYS:
+        total[key] = total.get(key, 0) + chunk.get(key, 0)
+    return total
+
+
+def finalize_rollout_metrics(counts):
+    goal_choices = counts.get("goal_choice_count", 0)
+    sync_choices = counts.get("sync_choice_count", 0)
+    episode_count = counts.get("episode_end_count", 0)
+    return {
+        "sync_choice_rate": 0.0 if goal_choices == 0 else counts.get("sync_choice_count", 0) / goal_choices,
+        "zero_distance_sync_choice_rate": 0.0
+        if sync_choices == 0
+        else counts.get("zero_distance_sync_choice_count", 0) / sync_choices,
+        "sync_bump_completed_count": counts.get("sync_bump_completed_count", 0),
+        "sync_reached_but_not_bumped_count": counts.get("sync_reached_but_not_bumped_count", 0),
+        "decision_trigger_object_collected": counts.get("decision_trigger_object_collected", 0),
+        "decision_trigger_goals_completed": counts.get("decision_trigger_goals_completed", 0),
+        "decision_trigger_max_plan_steps": counts.get("decision_trigger_max_plan_steps", 0),
+        "remaining_objects_at_episode_end": 0.0
+        if episode_count == 0
+        else counts.get("remaining_objects_at_episode_end_sum", 0) / episode_count,
+    }
 
 
 def evaluate_agent(env_args, agent, episodes, deterministic=True):
@@ -139,7 +198,47 @@ def init_rollout_worker(env_args, agent_kwargs, torch_threads):
     _WORKER_AGENT = AutoregressiveAssignmentPPOAgent(**agent_kwargs)
 
 
-def rollout_worker(actor_state, critic_state, seed, episodes):
+def tensor_to_plain(x):
+    if isinstance(x, torch.Tensor):
+        if x.numel() == 1:
+            return float(x.detach().cpu().item())
+        return x.detach().cpu().tolist()
+    return x
+
+
+def transition_to_plain(t):
+    return {
+        "decision_state": copy.deepcopy(t.decision_state),
+        "agent_order": list(t.agent_order),
+        "targets": copy.deepcopy(t.targets),
+        "target_indices": copy.deepcopy(t.target_indices),
+        "old_joint_logprob": tensor_to_plain(t.old_joint_logprob),
+        "old_value": tensor_to_plain(t.old_value),
+        "old_entropy": tensor_to_plain(t.old_entropy),
+        "macro_reward": float(t.macro_reward),
+        "duration": int(t.duration),
+        "next_decision_state": copy.deepcopy(t.next_decision_state),
+        "done": bool(t.done),
+    }
+
+
+def transition_from_plain(d):
+    return MacroTransition(
+        decision_state=d["decision_state"],
+        agent_order=d["agent_order"],
+        targets=d["targets"],
+        target_indices=d["target_indices"],
+        old_joint_logprob=float(d["old_joint_logprob"]),
+        old_value=float(d["old_value"]),
+        old_entropy=float(d["old_entropy"]),
+        macro_reward=float(d["macro_reward"]),
+        duration=int(d["duration"]),
+        next_decision_state=d["next_decision_state"],
+        done=bool(d["done"]),
+    )
+
+
+def rollout_worker(actor_state, critic_state, seed, episodes, worker_transport):
     random.seed(seed)
     torch.manual_seed(seed)
 
@@ -149,6 +248,7 @@ def rollout_worker(actor_state, critic_state, seed, episodes):
     _WORKER_AGENT.actor.load_state_dict(actor_state)
     _WORKER_AGENT.critic.load_state_dict(critic_state)
     _WORKER_AGENT.rollout_buffer.clear()
+    _WORKER_AGENT.reset_rollout_metrics()
 
     rewards = []
     lengths = []
@@ -161,7 +261,9 @@ def rollout_worker(actor_state, critic_state, seed, episodes):
         macros.append(macro_count)
 
     transitions = list(_WORKER_AGENT.rollout_buffer.transitions)
-    return rewards, lengths, macros, transitions
+    if worker_transport == "plain":
+        transitions = [transition_to_plain(transition) for transition in transitions]
+    return rewards, lengths, macros, transitions, _WORKER_AGENT.get_rollout_metrics()
 
 
 def episode_chunks(total_episodes, workers, requested_chunk_size):
@@ -179,6 +281,7 @@ def episode_chunks(total_episodes, workers, requested_chunk_size):
 
 
 def collect_rollouts_serial(env_args, agent, args, progress, update, last_eval_reward):
+    agent.reset_rollout_metrics()
     rewards = []
     lengths = []
     macros = []
@@ -198,7 +301,7 @@ def collect_rollouts_serial(env_args, agent, args, progress, update, last_eval_r
             workers=1,
             eval="-" if last_eval_reward is None else f"{last_eval_reward:.2f}",
         )
-    return rewards, lengths, macros
+    return rewards, lengths, macros, agent.get_rollout_metrics()
 
 
 def collect_rollouts_parallel(agent, args, progress, update, last_eval_reward, executor):
@@ -209,6 +312,7 @@ def collect_rollouts_parallel(agent, args, progress, update, last_eval_reward, e
     rewards = []
     lengths = []
     macros = []
+    rollout_metric_counts = empty_rollout_metric_counts()
     completed = 0
     next_chunk_idx = 0
     pending = set()
@@ -226,6 +330,7 @@ def collect_rollouts_parallel(agent, args, progress, update, last_eval_reward, e
                 critic_state,
                 args.seed + update * 100_000 + chunk_idx * 1_003,
                 chunks[chunk_idx],
+                args.worker_transport,
             )
         )
 
@@ -235,8 +340,11 @@ def collect_rollouts_parallel(agent, args, progress, update, last_eval_reward, e
     while pending:
         done, pending = wait(pending, return_when=FIRST_COMPLETED)
         for future in done:
-            chunk_rewards, chunk_lengths, chunk_macros, chunk_transitions = future.result()
+            chunk_rewards, chunk_lengths, chunk_macros, chunk_transitions, chunk_metrics = future.result()
+            if args.worker_transport == "plain":
+                chunk_transitions = [transition_from_plain(transition) for transition in chunk_transitions]
             agent.rollout_buffer.transitions.extend(chunk_transitions)
+            add_rollout_metric_counts(rollout_metric_counts, chunk_metrics)
             rewards.extend(chunk_rewards)
             lengths.extend(chunk_lengths)
             macros.extend(chunk_macros)
@@ -254,7 +362,7 @@ def collect_rollouts_parallel(agent, args, progress, update, last_eval_reward, e
             )
             submit_next_chunk()
 
-    return rewards, lengths, macros
+    return rewards, lengths, macros, rollout_metric_counts
 
 
 def parse_args():
@@ -287,6 +395,12 @@ def parse_args():
     parser.add_argument("--workers", type=int, default=1, help="Parallel CPU rollout workers. Use 1 for serial rollouts.")
     parser.add_argument("--worker-chunk-size", type=int, default=0, help="Episodes per worker task. 0 uses dynamic one-episode tasks.")
     parser.add_argument("--worker-torch-threads", type=int, default=1, help="Torch intra-op threads per rollout worker.")
+    parser.add_argument(
+        "--worker-transport",
+        choices=["torch", "plain"],
+        default="plain",
+        help="How rollout workers return transitions. 'plain' converts tensors to Python floats/lists to avoid torch multiprocessing shared-memory mmap issues.",
+    )
     parser.add_argument("--strict-device", action="store_true", help="Fail instead of falling back when the requested device is unavailable.")
     return parser.parse_args()
 
@@ -354,6 +468,7 @@ def make_metrics_writer(log_dir):
         "max_candidate_count",
         "recompute_batches",
         "avg_recompute_batch_size",
+        *ROLLOUT_METRIC_FIELDNAMES,
     ]
     handle = open(metrics_path, "w", newline="", encoding="utf-8")
     writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -452,7 +567,7 @@ def main():
             agent.rollout_buffer.clear()
             rollout_start = time.perf_counter()
             if args.workers > 1:
-                rewards, lengths, macros = collect_rollouts_parallel(
+                rewards, lengths, macros, rollout_metric_counts = collect_rollouts_parallel(
                     agent,
                     args,
                     progress,
@@ -461,7 +576,7 @@ def main():
                     rollout_executor,
                 )
             else:
-                rewards, lengths, macros = collect_rollouts_serial(
+                rewards, lengths, macros, rollout_metric_counts = collect_rollouts_serial(
                     env_args,
                     agent,
                     args,
@@ -474,6 +589,7 @@ def main():
             progress.set_description(f"training PPO update {update}/{args.updates}")
             ppo_start = time.perf_counter()
             stats = agent.train_update()
+            stats.update(finalize_rollout_metrics(rollout_metric_counts))
             ppo_sec = time.perf_counter() - ppo_start
             avg_reward = sum(rewards) / len(rewards)
             avg_length = sum(lengths) / len(lengths)
@@ -574,6 +690,14 @@ def main():
                     "max_candidate_count": stats.get("max_candidate_count", 0),
                     "recompute_batches": stats.get("recompute_batches", 0),
                     "avg_recompute_batch_size": stats.get("avg_recompute_batch_size", 0.0),
+                    "sync_choice_rate": stats.get("sync_choice_rate", 0.0),
+                    "zero_distance_sync_choice_rate": stats.get("zero_distance_sync_choice_rate", 0.0),
+                    "sync_bump_completed_count": stats.get("sync_bump_completed_count", 0),
+                    "sync_reached_but_not_bumped_count": stats.get("sync_reached_but_not_bumped_count", 0),
+                    "decision_trigger_object_collected": stats.get("decision_trigger_object_collected", 0),
+                    "decision_trigger_goals_completed": stats.get("decision_trigger_goals_completed", 0),
+                    "decision_trigger_max_plan_steps": stats.get("decision_trigger_max_plan_steps", 0),
+                    "remaining_objects_at_episode_end": stats.get("remaining_objects_at_episode_end", 0.0),
                 }
             )
             metrics_handle.flush()
