@@ -19,11 +19,17 @@ pip install torch --index-url https://download.pytorch.org/whl/cu128
 pip install matplotlib tqdm
 ```
 
+On the school Slurm server, the provided `train_l4.sh` creates a pip venv in
+`/scratch/tmp/$USER/mas_foraging_venv`, writes Slurm logs to
+`/scratch/tmp/$USER/mas_foraging_logs`, and saves training runs under
+`runs/<run-name>` in this repository.
+
 ## Train
 
 ```bash
 python -m ppo_assignment.train \
   --run-name ppo_5x5_5a_server \
+  --runs-dir runs \
   --width 5 \
   --height 5 \
   --objects 10 \
@@ -44,6 +50,7 @@ python -m ppo_assignment.train \
   --device cuda \
   --workers 8 \
   --worker-chunk-size 0 \
+  --keep-best-checkpoints 5 \
   --strict-device
 ```
 

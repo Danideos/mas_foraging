@@ -278,9 +278,10 @@ def parse_args():
     parser.add_argument("--max-plan-steps", type=int, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--run-name", default=None, help="Name for foraging/runs/<run-name> outputs.")
-    parser.add_argument("--runs-dir", default="foraging/runs", help="Base directory for run outputs.")
-    parser.add_argument("--checkpoint", default=None, help="Checkpoint path. Defaults to foraging/runs/<run-name>/checkpoints/latest.pt.")
+    parser.add_argument("--run-name", default=None, help="Name for runs/<run-name> outputs.")
+    parser.add_argument("--runs-dir", default="runs", help="Base directory for run outputs.")
+    parser.add_argument("--checkpoint", default=None, help="Checkpoint path. Defaults to runs/<run-name>/checkpoints/latest.pt.")
+    parser.add_argument("--keep-best-checkpoints", type=int, default=5, help="Keep the top N eval checkpoints by reward. Use 0 to disable.")
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress reporting.")
     parser.add_argument("--print-every", type=int, default=0, help="Also print update stats every N updates.")
     parser.add_argument("--workers", type=int, default=1, help="Parallel CPU rollout workers. Use 1 for serial rollouts.")
@@ -365,6 +366,24 @@ def pct(part, total):
     return 0.0 if total <= 0 else 100.0 * part / total
 
 
+def save_best_checkpoint(agent, checkpoint_dir, update, eval_reward, best_checkpoints, keep_best):
+    if keep_best <= 0:
+        return best_checkpoints
+
+    checkpoint_path = checkpoint_dir / f"best_update_{update:04d}_reward_{eval_reward:.3f}.pt"
+    agent.save(checkpoint_path)
+    best_checkpoints.append((eval_reward, checkpoint_path))
+    best_checkpoints.sort(key=lambda item: item[0], reverse=True)
+
+    for _, path in best_checkpoints[keep_best:]:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+    return best_checkpoints[:keep_best]
+
+
 def main():
     args = parse_args()
     random.seed(args.seed)
@@ -405,6 +424,8 @@ def main():
     )
 
     last_eval_reward = None
+    best_checkpoints = []
+    checkpoint_dir = checkpoint_path.parent
     total_episodes = args.updates * args.episodes_per_update
     progress = tqdm(
         total=total_episodes,
@@ -505,9 +526,15 @@ def main():
                 )
                 checkpoint_start = time.perf_counter()
                 agent.save(checkpoint_path)
+                best_checkpoints = save_best_checkpoint(
+                    agent,
+                    checkpoint_dir,
+                    update,
+                    eval_stats["avg_reward"],
+                    best_checkpoints,
+                    args.keep_best_checkpoints,
+                )
                 checkpoint_sec = time.perf_counter() - checkpoint_start
-                update_checkpoint = checkpoint_path.parent / f"update_{update:04d}.pt"
-                agent.save(update_checkpoint)
 
             total_update_sec = time.perf_counter() - update_start
             episodes_per_sec = len(rewards) / rollout_sec if rollout_sec > 0 else 0.0
