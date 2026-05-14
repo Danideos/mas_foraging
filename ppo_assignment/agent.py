@@ -86,12 +86,8 @@ class AutoregressiveAssignmentPPOAgent:
         return [values[idx] for idx in indices]
 
     def transition_token_count(self, transition):
-        visible_count = (
-            len(transition.decision_state[1])
-            if transition.visible_agent_indices is None
-            else len(transition.visible_agent_indices)
-        )
-        return max(visible_count + self.transition_candidate_count(transition), 1)
+        full_agent_count = len(transition.decision_state[1])
+        return max(full_agent_count + self.transition_candidate_count(transition), 1)
 
     def dynamic_transition_batches(self, indices, transitions):
         max_batch_size = max(int(self.ppo_minibatch_size), 1)
@@ -236,6 +232,69 @@ class AutoregressiveAssignmentPPOAgent:
         world_map, agent_locations = state
         return world_map, [agent_locations[agent_idx] for agent_idx in visible_agent_indices]
 
+    def active_plan_copy(self):
+        return {} if self.active_plan is None else copy.deepcopy(self.active_plan)
+
+    @staticmethod
+    def valid_object_assignment(world_map, goal):
+        return goal is not None and goal[0] == "object" and target_exists(world_map, goal[1:])
+
+    def visible_agents_for_decision(self, world_map, agent_count, extra_visible=None):
+        extra_visible = set() if extra_visible is None else set(extra_visible)
+        active_plan = self.active_plan or {}
+        visible = []
+        for agent_idx in range(agent_count):
+            goal = active_plan.get(agent_idx)
+            if agent_idx in extra_visible or not self.valid_object_assignment(world_map, goal):
+                visible.append(agent_idx)
+        return visible
+
+    def assignment_counts(self, goals, active_plan_before, visible_agent_indices, visible_targets=None):
+        visible_set = set(visible_agent_indices or [])
+        visible_targets = {} if visible_targets is None else visible_targets
+        locked_counts = {goal: 0 for goal in goals}
+        visible_counts = {goal: 0 for goal in goals}
+
+        for agent_idx, goal in (active_plan_before or {}).items():
+            if goal in locked_counts and agent_idx not in visible_set:
+                locked_counts[goal] += 1
+        for goal in visible_targets.values():
+            if goal in visible_counts:
+                visible_counts[goal] += 1
+        return locked_counts, visible_counts
+
+    def assignment_context(self, agent_pos, candidate_goals, active_plan_before, visible_agent_indices, visible_targets, h, w):
+        distance_scale = max(float((h - 1) + (w - 1)), 1.0)
+        agent_scale = max(float(len(active_plan_before or {}) or self.agents), 1.0)
+        locked_counts, visible_counts = self.assignment_counts(
+            candidate_goals,
+            active_plan_before,
+            visible_agent_indices,
+            visible_targets=visible_targets,
+        )
+        rows = []
+        ax, ay = agent_pos
+        for goal in candidate_goals:
+            level = float(goal[3])
+            locked_count = float(locked_counts.get(goal, 0))
+            visible_count = float(visible_counts.get(goal, 0))
+            total_count = locked_count + visible_count
+            total_after = total_count + 1.0
+            remaining_need = max(0.0, level - total_count)
+            rows.append(
+                [
+                    (abs(float(ax) - float(goal[1])) + abs(float(ay) - float(goal[2]))) / distance_scale,
+                    level / max(float(self.agents), 1.0),
+                    locked_count / agent_scale,
+                    visible_count / agent_scale,
+                    total_count / agent_scale,
+                    remaining_need / agent_scale,
+                    1.0 if total_after >= level else 0.0,
+                    1.0 if total_after > level else 0.0,
+                ]
+            )
+        return rows
+
     def action(self, state, deterministic=False):
         world_map, agent_locations = state
         h = len(world_map)
@@ -269,6 +328,9 @@ class AutoregressiveAssignmentPPOAgent:
         )
 
         if need_decision:
+            active_plan_before = self.active_plan_copy()
+            extra_visible = self.current_macro.get("visible_agent_indices", []) if max_plan_steps_reached and self.current_macro else []
+            visible_agent_indices = self.visible_agents_for_decision(world_map, num_agents, extra_visible=extra_visible)
             if object_collected:
                 self.rollout_metrics["decision_trigger_object_collected"] += 1
             if max_plan_steps_reached:
@@ -277,32 +339,44 @@ class AutoregressiveAssignmentPPOAgent:
             if self.current_macro is not None:
                 self.close_current_macro(next_state=state, done=False)
 
-            with torch.no_grad():
-                active_plan, target_indices, agent_order, joint_logprob, joint_entropy = self.make_assignment_decision(
-                    state,
-                    deterministic=deterministic,
-                )
-                goals = critic_goals(world_map, agent_locations, h, w)
-                value = self.critic(state, h, w, num_agents, goals)
-
-            self.active_plan = active_plan
-            self.rollout_metrics["goal_choice_count"] += len(active_plan)
-            self.object_bounce_targets = {}
-            self.current_macro = {
-                "mode": "normal",
-                "decision_state": self.copy_state(state),
-                "visible_agent_indices": None,
-                "filtered_goals": None,
-                "agent_order": list(agent_order),
-                "targets": copy.deepcopy(active_plan),
-                "target_indices": copy.deepcopy(target_indices),
-                "old_joint_logprob": float(joint_logprob.detach().cpu().item()),
-                "old_value": float(value.detach().cpu().item()),
-                "old_entropy": float(joint_entropy.detach().cpu().item()),
-                "macro_reward": 0.0,
-                "duration": 0,
+            self.active_plan = active_plan_before
+            self.object_bounce_targets = {
+                agent_idx: goal
+                for agent_idx, goal in self.object_bounce_targets.items()
+                if self.valid_object_assignment(world_map, self.active_plan.get(agent_idx))
             }
-            self.plan_duration = 0
+
+            goals = critic_goals(world_map, agent_locations, h, w)
+            if visible_agent_indices and goals:
+                with torch.no_grad():
+                    targets, target_indices, agent_order, joint_logprob, joint_entropy = self.make_assignment_decision(
+                        state,
+                        deterministic=deterministic,
+                        visible_agent_indices=visible_agent_indices,
+                        active_plan_before=active_plan_before,
+                    )
+                    value = self.critic(state, h, w, num_agents, goals)
+
+                for agent_idx, goal in targets.items():
+                    self.active_plan[agent_idx] = goal
+                self.rollout_metrics["goal_choice_count"] += len(targets)
+                self.current_macro = {
+                    "mode": "normal",
+                    "decision_state": self.copy_state(state),
+                    "active_plan_before": copy.deepcopy(active_plan_before),
+                    "active_plan_after": self.active_plan_copy(),
+                    "visible_agent_indices": list(visible_agent_indices),
+                    "filtered_goals": None,
+                    "agent_order": list(agent_order),
+                    "targets": copy.deepcopy(targets),
+                    "target_indices": copy.deepcopy(target_indices),
+                    "old_joint_logprob": float(joint_logprob.detach().cpu().item()),
+                    "old_value": float(value.detach().cpu().item()),
+                    "old_entropy": float(joint_entropy.detach().cpu().item()),
+                    "macro_reward": 0.0,
+                    "duration": 0,
+                }
+                self.plan_duration = 0
 
         self._last_world_map = world_map
         primitive_actions = self.goals_to_primitive_actions(agent_locations, h, w)
@@ -321,6 +395,7 @@ class AutoregressiveAssignmentPPOAgent:
 
         sync_complete = self.parity_sync_complete()
         max_plan_steps_reached = self.current_macro is not None and self.plan_duration >= self.max_plan_steps
+        timed_out_visible = self.current_macro.get("visible_agent_indices", []) if max_plan_steps_reached and self.current_macro else []
         if self.current_macro is not None and (
             object_collected or sync_complete or max_plan_steps_reached
         ):
@@ -332,8 +407,11 @@ class AutoregressiveAssignmentPPOAgent:
             if max_plan_steps_reached:
                 self.rollout_metrics["decision_trigger_max_plan_steps"] += 1
             self.close_current_macro(next_state=state, done=False)
-            self.active_plan = None
-            self.object_bounce_targets = {}
+            self.object_bounce_targets = {
+                agent_idx: goal
+                for agent_idx, goal in self.object_bounce_targets.items()
+                if self.active_plan and self.valid_object_assignment(world_map, self.active_plan.get(agent_idx))
+            }
 
         if sync_complete:
             self.parity_phase_done = True
@@ -344,27 +422,38 @@ class AutoregressiveAssignmentPPOAgent:
         ready_indices = self.parity_ready_indices()
         filtered_goals = self.filter_object_goals(world_map, len(ready_indices))
 
-        if self.current_macro is None and ready_indices and filtered_goals:
+        active_plan_before = self.active_plan_copy()
+        visible_ready_indices = [
+            agent_idx
+            for agent_idx in ready_indices
+            if agent_idx in timed_out_visible or not self.valid_object_assignment(world_map, active_plan_before.get(agent_idx))
+        ]
+
+        if self.current_macro is None and visible_ready_indices and filtered_goals:
             with torch.no_grad():
-                active_plan, target_indices, agent_order, joint_logprob, joint_entropy = self.make_assignment_decision(
+                targets, target_indices, agent_order, joint_logprob, joint_entropy = self.make_assignment_decision(
                     state,
                     deterministic=deterministic,
-                    visible_agent_indices=ready_indices,
+                    visible_agent_indices=visible_ready_indices,
                     filtered_goals=filtered_goals,
+                    active_plan_before=active_plan_before,
                 )
-                value_state = self.visible_state(state, ready_indices)
-                value = self.critic(value_state, h, w, len(ready_indices), filtered_goals)
+                goals = critic_goals(world_map, agent_locations, h, w)
+                value = self.critic(state, h, w, len(agent_locations), goals)
 
-            self.active_plan = active_plan
-            self.rollout_metrics["goal_choice_count"] += len(active_plan)
-            self.object_bounce_targets = {}
+            self.active_plan = active_plan_before
+            for agent_idx, goal in targets.items():
+                self.active_plan[agent_idx] = goal
+            self.rollout_metrics["goal_choice_count"] += len(targets)
             self.current_macro = {
                 "mode": "parity_ready_subproblem",
                 "decision_state": self.copy_state(state),
-                "visible_agent_indices": list(ready_indices),
+                "active_plan_before": copy.deepcopy(active_plan_before),
+                "active_plan_after": self.active_plan_copy(),
+                "visible_agent_indices": list(visible_ready_indices),
                 "filtered_goals": copy.deepcopy(filtered_goals),
                 "agent_order": list(agent_order),
-                "targets": copy.deepcopy(active_plan),
+                "targets": copy.deepcopy(targets),
                 "target_indices": copy.deepcopy(target_indices),
                 "old_joint_logprob": float(joint_logprob.detach().cpu().item()),
                 "old_value": float(value.detach().cpu().item()),
@@ -411,7 +500,14 @@ class AutoregressiveAssignmentPPOAgent:
                 actions.append(move_towards(agent_pos, goal, h, w))
         return actions
 
-    def make_assignment_decision(self, state, deterministic=False, visible_agent_indices=None, filtered_goals=None):
+    def make_assignment_decision(
+        self,
+        state,
+        deterministic=False,
+        visible_agent_indices=None,
+        filtered_goals=None,
+        active_plan_before=None,
+    ):
         world_map, agent_locations = state
         h = len(world_map)
         w = len(world_map[0]) if h > 0 else self.w
@@ -419,23 +515,18 @@ class AutoregressiveAssignmentPPOAgent:
             visible_agent_indices = list(range(len(agent_locations)))
         else:
             visible_agent_indices = list(visible_agent_indices)
-        visible_locations = [agent_locations[agent_idx] for agent_idx in visible_agent_indices]
-        original_to_local = {
-            agent_idx: local_idx
-            for local_idx, agent_idx in enumerate(visible_agent_indices)
-        }
-        num_agents = len(visible_locations)
+        active_plan_before = {} if active_plan_before is None else copy.deepcopy(active_plan_before)
+        num_agents = len(agent_locations)
         encoder_goals = (
             list(filtered_goals)
             if filtered_goals is not None
-            else critic_goals(world_map, visible_locations, h, w)
+            else critic_goals(world_map, agent_locations, h, w)
         )
         if not encoder_goals:
             return {}, {}, list(visible_agent_indices), torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
 
-        actor_state = (world_map, visible_locations)
         agent_embeddings, goal_embeddings, global_embedding = self.actor.encode_state(
-            actor_state,
+            state,
             h,
             w,
             num_agents,
@@ -452,20 +543,29 @@ class AutoregressiveAssignmentPPOAgent:
         target_indices = {}
         joint_logprob = torch.tensor(0.0, device=self.device)
         joint_entropy = torch.tensor(0.0, device=self.device)
+        visible_targets_so_far = {}
 
         for step_idx, agent_idx in enumerate(agent_order):
-            local_agent_idx = original_to_local[agent_idx]
             candidate_goals = (
                 list(filtered_goals)
                 if filtered_goals is not None
                 else candidate_goals_for_agent(world_map, agent_locations[agent_idx], h, w)
             )
             candidate_goal_indices = [encoder_goals.index(goal) for goal in candidate_goals]
+            assignment_context = self.assignment_context(
+                agent_locations[agent_idx],
+                candidate_goals,
+                active_plan_before,
+                visible_agent_indices,
+                visible_targets_so_far,
+                h,
+                w,
+            )
             logits = self.actor.decision_logits(
-                local_agent_idx,
+                agent_idx,
                 step_idx,
                 previous_decision_tokens,
-                visible_locations,
+                agent_locations,
                 candidate_goals,
                 agent_embeddings,
                 goal_embeddings[candidate_goal_indices],
@@ -473,6 +573,7 @@ class AutoregressiveAssignmentPPOAgent:
                 h,
                 w,
                 num_agents,
+                assignment_context=assignment_context,
             )
             dist = Categorical(logits=logits)
             if deterministic:
@@ -481,15 +582,16 @@ class AutoregressiveAssignmentPPOAgent:
                 selected_goal_idx = dist.sample()
             goal_idx_int = int(selected_goal_idx.item())
             targets[agent_idx] = candidate_goals[goal_idx_int]
+            visible_targets_so_far[agent_idx] = candidate_goals[goal_idx_int]
             target_indices[agent_idx] = goal_idx_int
             joint_logprob = joint_logprob + dist.log_prob(selected_goal_idx)
             joint_entropy = joint_entropy + dist.entropy()
             previous_decision_tokens.append(
                 self.actor.build_previous_decision_token(
-                    local_agent_idx,
+                    agent_idx,
                     candidate_goal_indices[goal_idx_int],
                     step_idx,
-                    visible_locations,
+                    agent_locations,
                     encoder_goals,
                     agent_embeddings,
                     goal_embeddings,
@@ -543,6 +645,8 @@ class AutoregressiveAssignmentPPOAgent:
                 next_decision_state=self.copy_state(next_state),
                 done=bool(done),
                 mode=macro.get("mode", "normal"),
+                active_plan_before=copy.deepcopy(macro.get("active_plan_before")),
+                active_plan_after=copy.deepcopy(self.active_plan if self.active_plan is not None else macro.get("active_plan_after")),
                 visible_agent_indices=copy.deepcopy(macro.get("visible_agent_indices")),
                 filtered_goals=copy.deepcopy(macro.get("filtered_goals")),
                 next_visible_agent_indices=copy.deepcopy(next_visible_agent_indices),
@@ -559,6 +663,7 @@ class AutoregressiveAssignmentPPOAgent:
         target_indices=None,
         visible_agent_indices=None,
         filtered_goals=None,
+        active_plan_before=None,
     ):
         world_map, agent_locations = decision_state
         h = len(world_map)
@@ -567,23 +672,18 @@ class AutoregressiveAssignmentPPOAgent:
             visible_agent_indices = list(range(len(agent_locations)))
         else:
             visible_agent_indices = list(visible_agent_indices)
-        visible_locations = [agent_locations[agent_idx] for agent_idx in visible_agent_indices]
-        original_to_local = {
-            agent_idx: local_idx
-            for local_idx, agent_idx in enumerate(visible_agent_indices)
-        }
-        num_agents = len(visible_locations)
+        active_plan_before = {} if active_plan_before is None else copy.deepcopy(active_plan_before)
+        num_agents = len(agent_locations)
         encoder_goals = (
             list(filtered_goals)
             if filtered_goals is not None
-            else critic_goals(world_map, visible_locations, h, w)
+            else critic_goals(world_map, agent_locations, h, w)
         )
         if not encoder_goals:
             return torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
 
-        actor_state = (world_map, visible_locations)
         agent_embeddings, goal_embeddings, global_embedding = self.actor.encode_state(
-            actor_state,
+            decision_state,
             h,
             w,
             num_agents,
@@ -592,9 +692,9 @@ class AutoregressiveAssignmentPPOAgent:
         previous_decision_tokens = []
         new_joint_logprob = torch.tensor(0.0, device=self.device)
         new_entropy = torch.tensor(0.0, device=self.device)
+        visible_targets_so_far = {}
 
         for step_idx, agent_idx in enumerate(agent_order):
-            local_agent_idx = original_to_local[agent_idx]
             stored_target = targets[agent_idx]
             candidate_goals = (
                 list(filtered_goals)
@@ -615,11 +715,20 @@ class AutoregressiveAssignmentPPOAgent:
                         f"{candidate_goals[stored_candidate_goal_idx]}, expected {stored_target}."
                     )
 
+            assignment_context = self.assignment_context(
+                agent_locations[agent_idx],
+                candidate_goals,
+                active_plan_before,
+                visible_agent_indices,
+                visible_targets_so_far,
+                h,
+                w,
+            )
             logits = self.actor.decision_logits(
-                local_agent_idx,
+                agent_idx,
                 step_idx,
                 previous_decision_tokens,
-                visible_locations,
+                agent_locations,
                 candidate_goals,
                 agent_embeddings,
                 goal_embeddings[candidate_goal_indices],
@@ -627,17 +736,19 @@ class AutoregressiveAssignmentPPOAgent:
                 h,
                 w,
                 num_agents,
+                assignment_context=assignment_context,
             )
             dist = Categorical(logits=logits)
             action_tensor = torch.tensor(stored_candidate_goal_idx, dtype=torch.long, device=self.device)
             new_joint_logprob = new_joint_logprob + dist.log_prob(action_tensor)
             new_entropy = new_entropy + dist.entropy()
+            visible_targets_so_far[agent_idx] = stored_target
             previous_decision_tokens.append(
                 self.actor.build_previous_decision_token(
-                    local_agent_idx,
+                    agent_idx,
                     candidate_goal_indices[stored_candidate_goal_idx],
                     step_idx,
-                    visible_locations,
+                    agent_locations,
                     encoder_goals,
                     agent_embeddings,
                     goal_embeddings,
@@ -657,27 +768,19 @@ class AutoregressiveAssignmentPPOAgent:
             list(range(len(state[1]))) if transition.visible_agent_indices is None else list(transition.visible_agent_indices)
             for state, transition in zip(states, transitions)
         ]
-        visible_locations_batch = [
-            [state[1][agent_idx] for agent_idx in visible_indices]
-            for state, visible_indices in zip(states, visible_indices_batch)
-        ]
-        num_agents = len(visible_locations_batch[0])
+        num_agents = len(states[0][1])
         encoder_goals_batch = [
             list(transition.filtered_goals)
             if transition.filtered_goals is not None
-            else critic_goals(state[0], visible_locations, h, w)
-            for state, visible_locations, transition in zip(states, visible_locations_batch, transitions)
+            else critic_goals(state[0], state[1], h, w)
+            for state, transition in zip(states, transitions)
         ]
         if not encoder_goals_batch or len(encoder_goals_batch[0]) == 0 or num_agents == 0:
             zeros = torch.zeros(len(transitions), dtype=torch.float32, device=self.device)
             return zeros, zeros
 
-        actor_states = [
-            (state[0], visible_locations)
-            for state, visible_locations in zip(states, visible_locations_batch)
-        ]
         agent_embeddings, goal_embeddings, global_embedding = self.actor.encode_states_batch(
-            actor_states,
+            states,
             h,
             w,
             num_agents,
@@ -688,16 +791,15 @@ class AutoregressiveAssignmentPPOAgent:
         batch_size = len(transitions)
         new_joint_logprob = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
         new_entropy = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
+        visible_targets_so_far_batch = [{} for _ in transitions]
 
-        for step_idx in range(num_agents):
+        visible_steps = len(transitions[0].agent_order)
+        for step_idx in range(visible_steps):
             agent_indices_all = [transition.agent_order[step_idx] for transition in transitions]
-            local_agent_indices_all = [
-                visible_indices_batch[row].index(agent_indices_all[row])
-                for row in range(batch_size)
-            ]
             stored_candidate_goal_indices_all = []
             candidate_goals_batch_all = []
             candidate_encoder_indices_batch_all = []
+            assignment_context_batch = []
             for row, transition in enumerate(transitions):
                 stored_target = transition.targets[agent_indices_all[row]]
                 candidate_goals = (
@@ -713,6 +815,17 @@ class AutoregressiveAssignmentPPOAgent:
                 candidate_encoder_indices = [encoder_goals_batch[row].index(goal) for goal in candidate_goals]
                 candidate_goals_batch_all.append(candidate_goals)
                 candidate_encoder_indices_batch_all.append(candidate_encoder_indices)
+                assignment_context_batch.append(
+                    self.assignment_context(
+                        states[row][1][agent_indices_all[row]],
+                        candidate_goals,
+                        transition.active_plan_before or {},
+                        visible_indices_batch[row],
+                        visible_targets_so_far_batch[row],
+                        h,
+                        w,
+                    )
+                )
                 stored_candidate_goal_idx = transition.target_indices[agent_indices_all[row]]
                 if candidate_goals[stored_candidate_goal_idx] != stored_target:
                     raise ValueError(
@@ -730,10 +843,10 @@ class AutoregressiveAssignmentPPOAgent:
                 dim=0,
             )
             logits = self.actor.decision_logits_batch(
-                local_agent_indices_all,
+                agent_indices_all,
                 step_idx,
                 previous_decision_tokens,
-                visible_locations_batch,
+                [state[1] for state in states],
                 candidate_goals_batch_all,
                 agent_embeddings,
                 candidate_goal_embeddings,
@@ -741,6 +854,7 @@ class AutoregressiveAssignmentPPOAgent:
                 h,
                 w,
                 num_agents,
+                assignment_context_batch=assignment_context_batch,
             )
             dist = Categorical(logits=logits)
             action_tensor = torch.tensor(stored_candidate_goal_indices_all, dtype=torch.long, device=self.device)
@@ -748,12 +862,13 @@ class AutoregressiveAssignmentPPOAgent:
             new_entropy = new_entropy + dist.entropy()
             for row in range(batch_size):
                 selected_encoder_goal_indices[row] = candidate_encoder_indices_batch_all[row][stored_candidate_goal_indices_all[row]]
+                visible_targets_so_far_batch[row][agent_indices_all[row]] = transitions[row].targets[agent_indices_all[row]]
 
             token_batch = self.actor.build_previous_decision_tokens_batch(
-                local_agent_indices_all,
+                agent_indices_all,
                 selected_encoder_goal_indices,
                 step_idx,
-                visible_locations_batch,
+                [state[1] for state in states],
                 encoder_goals_batch,
                 agent_embeddings,
                 goal_embeddings,
@@ -766,42 +881,29 @@ class AutoregressiveAssignmentPPOAgent:
         return new_joint_logprob, new_entropy
 
     def critic_values_batch(self, states, visible_agent_indices_batch=None, filtered_goals_batch=None):
+        del visible_agent_indices_batch, filtered_goals_batch
         if not states:
             return torch.empty(0, dtype=torch.float32, device=self.device)
 
         values = [None] * len(states)
         groups = defaultdict(list)
         goals_cache = []
-        visible_locations_cache = []
         for idx, state in enumerate(states):
             h = len(state[0])
             w = len(state[0][0]) if h > 0 else self.w
-            visible_agent_indices = (
-                list(range(len(state[1])))
-                if visible_agent_indices_batch is None or visible_agent_indices_batch[idx] is None
-                else list(visible_agent_indices_batch[idx])
-            )
-            visible_locations = [state[1][agent_idx] for agent_idx in visible_agent_indices]
-            goals = (
-                object_goals(state[0])
-                if filtered_goals_batch is None or filtered_goals_batch[idx] is None
-                else list(filtered_goals_batch[idx])
-            )
+            agent_locations = state[1]
+            goals = object_goals(state[0])
             goals_cache.append(goals)
-            visible_locations_cache.append(visible_locations)
-            if not visible_locations or not goals:
+            if not agent_locations or not goals:
                 values[idx] = torch.tensor(0.0, dtype=torch.float32, device=self.device)
             else:
-                groups[(h, w, len(visible_locations), len(goals))].append(idx)
+                groups[(h, w, len(agent_locations), len(goals))].append(idx)
 
         for (h, w, num_agents, num_goals), indices in groups.items():
             batch_size = self.model_batch_size(num_agents, num_goals)
             for start, end in self.batch_slices(len(indices), batch_size):
                 chunk_indices = indices[start:end]
-                group_states = [
-                    (states[idx][0], visible_locations_cache[idx])
-                    for idx in chunk_indices
-                ]
+                group_states = [states[idx] for idx in chunk_indices]
                 group_goals = [goals_cache[idx] for idx in chunk_indices]
                 group_values = self.critic.forward_batch(
                     group_states,
@@ -823,8 +925,9 @@ class AutoregressiveAssignmentPPOAgent:
             world_map, agent_locations = transition.decision_state
             h = len(world_map)
             w = len(world_map[0]) if h > 0 else self.w
+            full_agent_count = len(agent_locations)
             visible_count = (
-                len(agent_locations)
+                full_agent_count
                 if transition.visible_agent_indices is None
                 else len(transition.visible_agent_indices)
             )
@@ -833,12 +936,12 @@ class AutoregressiveAssignmentPPOAgent:
                 if transition.filtered_goals is None
                 else len(transition.filtered_goals)
             )
-            groups[(h, w, visible_count, goal_count)].append(idx)
+            groups[(h, w, full_agent_count, visible_count, goal_count)].append(idx)
 
         chunk_count = 0
         chunk_size_sum = 0
-        for (_, _, num_agents, num_goals), indices in groups.items():
-            batch_size = self.model_batch_size(num_agents, num_goals)
+        for (_, _, full_agent_count, _, goal_count), indices in groups.items():
+            batch_size = self.model_batch_size(full_agent_count, goal_count)
             for start, end in self.batch_slices(len(indices), batch_size):
                 chunk_indices = indices[start:end]
                 group_transitions = [transitions[idx] for idx in chunk_indices]

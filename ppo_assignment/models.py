@@ -6,6 +6,7 @@ MAX_LEVEL = 10
 LEVEL_ONE_HOT_DIM = MAX_LEVEL + 1
 AGENT_FEATURE_DIM = 2
 GOAL_FEATURE_DIM = 2 + LEVEL_ONE_HOT_DIM
+ASSIGNMENT_CONTEXT_DIM = 8
 
 
 def mlp(sizes, activation=nn.Tanh, final_activation=None):
@@ -139,7 +140,7 @@ class Actor(nn.Module):
         self.prev_decision_mlp = mlp([hidden_dim * 2 + 1, hidden_dim, hidden_dim])
         self.query_mlp = mlp([hidden_dim * 2 + 1, hidden_dim, hidden_dim])
         self.attention = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True, dropout=0.0)
-        self.scorer = mlp([hidden_dim * 4 + 1, hidden_dim, hidden_dim, 1])
+        self.scorer = mlp([hidden_dim * 4 + ASSIGNMENT_CONTEXT_DIM, hidden_dim, hidden_dim, 1])
 
     def encode_state(self, state, h, w, num_agents, goals):
         _, agent_locations = state
@@ -161,6 +162,7 @@ class Actor(nn.Module):
         h,
         w,
         num_agents,
+        assignment_context=None,
     ):
         del agent_locations, goals, h, w, num_agents
         device = agent_embeddings.device
@@ -181,6 +183,7 @@ class Actor(nn.Module):
         h,
         w,
         num_agents,
+        assignment_context=None,
     ):
         del num_agents
         if len(goals) == 0:
@@ -199,14 +202,25 @@ class Actor(nn.Module):
 
         ax, ay = agent_locations[agent_idx]
         distance_scale = max(float((h - 1) + (w - 1)), 1.0)
-        distances = torch.tensor(
-            [
-                (abs(float(ax) - float(goal[1])) + abs(float(ay) - float(goal[2]))) / distance_scale
-                for goal in goals
-            ],
-            dtype=torch.float32,
-            device=device,
-        ).unsqueeze(1)
+        distances = [
+            (abs(float(ax) - float(goal[1])) + abs(float(ay) - float(goal[2]))) / distance_scale
+            for goal in goals
+        ]
+        if assignment_context is None:
+            assignment_context = [
+                [
+                    distances[idx],
+                    float(goal[3]) / float(MAX_LEVEL),
+                    0.0,
+                    0.0,
+                    0.0,
+                    float(goal[3]) / float(MAX_LEVEL),
+                    0.0,
+                    0.0,
+                ]
+                for idx, goal in enumerate(goals)
+            ]
+        context_tensor = torch.tensor(assignment_context, dtype=torch.float32, device=device)
         num_goals = len(goals)
         score_input = torch.cat(
             [
@@ -214,7 +228,7 @@ class Actor(nn.Module):
                 agent_embeddings[agent_idx].unsqueeze(0).expand(num_goals, -1),
                 goal_embeddings,
                 global_embedding.unsqueeze(0).expand(num_goals, -1),
-                distances,
+                context_tensor,
             ],
             dim=1,
         )
@@ -232,6 +246,7 @@ class Actor(nn.Module):
         h,
         w,
         num_agents,
+        assignment_context_batch=None,
     ):
         del agent_locations_batch, goals_batch, h, w, num_agents
         device = agent_embeddings.device
@@ -263,6 +278,7 @@ class Actor(nn.Module):
         h,
         w,
         num_agents,
+        assignment_context_batch=None,
     ):
         del num_agents
         if not goals_batch or len(goals_batch[0]) == 0:
@@ -294,14 +310,32 @@ class Actor(nn.Module):
                     for goal in goals_batch[row]
                 ]
             )
-        distance_tensor = torch.tensor(distances, dtype=torch.float32, device=device).unsqueeze(2)
+        if assignment_context_batch is None:
+            assignment_context_batch = []
+            for row, goals in enumerate(goals_batch):
+                assignment_context_batch.append(
+                    [
+                        [
+                            distances[row][goal_idx],
+                            float(goal[3]) / float(MAX_LEVEL),
+                            0.0,
+                            0.0,
+                            0.0,
+                            float(goal[3]) / float(MAX_LEVEL),
+                            0.0,
+                            0.0,
+                        ]
+                        for goal_idx, goal in enumerate(goals)
+                    ]
+                )
+        context_tensor = torch.tensor(assignment_context_batch, dtype=torch.float32, device=device)
         score_input = torch.cat(
             [
                 decision_context.unsqueeze(1).expand(-1, num_goals, -1),
                 current_agent_embeddings.unsqueeze(1).expand(-1, num_goals, -1),
                 goal_embeddings[:, :num_goals, :],
                 global_embedding.unsqueeze(1).expand(-1, num_goals, -1),
-                distance_tensor,
+                context_tensor,
             ],
             dim=2,
         )

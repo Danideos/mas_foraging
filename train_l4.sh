@@ -52,7 +52,7 @@ python -m ppo_assignment.train \
   --hidden-dim 128 --ppo-epochs 2 --ppo-minibatch-size 512 --ppo-token-budget 8192 \
   --lr 0.00025 --gamma 0.99 --gae-lambda 0.95 \
   --clip-eps 0.15 --value-coef 0.5 --entropy-coef 0.015 \
-  --max-plan-steps 10 \
+  --max-plan-steps 100 \
   --device cuda \
   --workers 64 --worker-chunk-size 0 --worker-torch-threads 1 \
   --worker-transport plain \

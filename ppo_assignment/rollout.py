@@ -15,6 +15,8 @@ class MacroTransition:
     next_decision_state: tuple
     done: bool
     mode: str = "normal"
+    active_plan_before: object = None
+    active_plan_after: object = None
     visible_agent_indices: object = None
     filtered_goals: object = None
     next_visible_agent_indices: object = None
