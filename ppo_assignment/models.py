@@ -4,8 +4,8 @@ from torch import nn
 MAX_AGENTS = 10
 MAX_LEVEL = 10
 LEVEL_ONE_HOT_DIM = MAX_LEVEL + 1
-AGENT_FEATURE_DIM = 4
-GOAL_FEATURE_DIM = 2 + 2 + LEVEL_ONE_HOT_DIM
+AGENT_FEATURE_DIM = 2
+GOAL_FEATURE_DIM = 2 + LEVEL_ONE_HOT_DIM
 
 
 def mlp(sizes, activation=nn.Tanh, final_activation=None):
@@ -21,14 +21,12 @@ def mlp(sizes, activation=nn.Tanh, final_activation=None):
     return nn.Sequential(*layers)
 
 
-def agent_features(agent_locations, h, w, device, sync_free=None):
+def agent_features(agent_locations, h, w, device):
     h_scale = max(float(h - 1), 1.0)
     w_scale = max(float(w - 1), 1.0)
-    if sync_free is None:
-        sync_free = [1.0] * len(agent_locations)
     rows = [
-        [float(x) / h_scale, float(y) / w_scale, float((x + y) % 2), float(sync_free[idx])]
-        for idx, (x, y) in enumerate(agent_locations)
+        [float(x) / h_scale, float(y) / w_scale]
+        for x, y in agent_locations
     ]
     return torch.tensor(rows, dtype=torch.float32, device=device)
 
@@ -37,8 +35,8 @@ def goal_features(goals, h, w, device):
     h_scale = max(float(h - 1), 1.0)
     w_scale = max(float(w - 1), 1.0)
     rows = []
-    for kind, x, y, level in goals:
-        level_idx = 0 if kind == "sync" else int(level)
+    for _, x, y, level in goals:
+        level_idx = int(level)
         if level_idx < 0 or level_idx > MAX_LEVEL:
             raise ValueError(f"Goal level {level_idx} is outside supported range 0..{MAX_LEVEL}.")
         one_hot = [0.0] * LEVEL_ONE_HOT_DIM
@@ -47,8 +45,6 @@ def goal_features(goals, h, w, device):
             [
                 float(x) / h_scale,
                 float(y) / w_scale,
-                1.0 if kind == "object" else 0.0,
-                1.0 if kind == "sync" else 0.0,
                 *one_hot,
             ]
         )
@@ -74,10 +70,10 @@ class StateEncoder(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
 
-    def forward(self, agent_locations, goals, h, w, num_agents, sync_free=None):
+    def forward(self, agent_locations, goals, h, w, num_agents):
         del num_agents
         device = next(self.parameters()).device
-        agent_tensor = agent_features(agent_locations, h, w, device, sync_free=sync_free)
+        agent_tensor = agent_features(agent_locations, h, w, device)
         goal_tensor = goal_features(goals, h, w, device)
 
         agent_tokens = self.agent_proj(agent_tensor) + self.type_embedding(
@@ -96,7 +92,7 @@ class StateEncoder(nn.Module):
         global_embedding = encoded.mean(dim=0)
         return agent_embeddings, goal_embeddings, global_embedding
 
-    def forward_batch(self, agent_locations_batch, goals_batch, h, w, num_agents, sync_free_batch=None):
+    def forward_batch(self, agent_locations_batch, goals_batch, h, w, num_agents):
         del num_agents
         device = next(self.parameters()).device
         batch_size = len(agent_locations_batch)
@@ -110,8 +106,7 @@ class StateEncoder(nn.Module):
 
         for batch_idx, (agent_locations, goals) in enumerate(zip(agent_locations_batch, goals_batch)):
             if agent_locations:
-                sync_free = None if sync_free_batch is None else sync_free_batch[batch_idx]
-                features = agent_features(agent_locations, h, w, device, sync_free=sync_free)
+                features = agent_features(agent_locations, h, w, device)
                 agent_tensor[batch_idx, : len(agent_locations)] = features
                 padding_mask[batch_idx, : len(agent_locations)] = False
             if goals:
@@ -146,13 +141,13 @@ class Actor(nn.Module):
         self.attention = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True, dropout=0.0)
         self.scorer = mlp([hidden_dim * 4 + 1, hidden_dim, hidden_dim, 1])
 
-    def encode_state(self, state, h, w, num_agents, goals, sync_free=None):
+    def encode_state(self, state, h, w, num_agents, goals):
         _, agent_locations = state
-        return self.encoder(agent_locations, goals, h, w, num_agents, sync_free=sync_free)
+        return self.encoder(agent_locations, goals, h, w, num_agents)
 
-    def encode_states_batch(self, states, h, w, num_agents, goals_batch, sync_free_batch=None):
+    def encode_states_batch(self, states, h, w, num_agents, goals_batch):
         agent_locations_batch = [state[1] for state in states]
-        return self.encoder.forward_batch(agent_locations_batch, goals_batch, h, w, num_agents, sync_free_batch=sync_free_batch)
+        return self.encoder.forward_batch(agent_locations_batch, goals_batch, h, w, num_agents)
 
     def build_previous_decision_token(
         self,
@@ -319,12 +314,12 @@ class Critic(nn.Module):
         self.encoder = StateEncoder(hidden_dim, num_layers, num_heads)
         self.value_head = mlp([hidden_dim, hidden_dim, hidden_dim, 1])
 
-    def forward(self, state, h, w, num_agents, goals, sync_free=None):
+    def forward(self, state, h, w, num_agents, goals):
         _, agent_locations = state
-        _, _, global_embedding = self.encoder(agent_locations, goals, h, w, num_agents, sync_free=sync_free)
+        _, _, global_embedding = self.encoder(agent_locations, goals, h, w, num_agents)
         return self.value_head(global_embedding).squeeze(-1)
 
-    def forward_batch(self, states, h, w, num_agents, goals_batch, sync_free_batch=None):
+    def forward_batch(self, states, h, w, num_agents, goals_batch):
         agent_locations_batch = [state[1] for state in states]
         _, _, global_embedding = self.encoder.forward_batch(
             agent_locations_batch,
@@ -332,6 +327,5 @@ class Critic(nn.Module):
             h,
             w,
             num_agents,
-            sync_free_batch=sync_free_batch,
         )
         return self.value_head(global_embedding).squeeze(-1)

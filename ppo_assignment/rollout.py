@@ -14,8 +14,11 @@ class MacroTransition:
     duration: int
     next_decision_state: tuple
     done: bool
-    decision_sync_free: object = None
-    next_decision_sync_free: object = None
+    mode: str = "normal"
+    visible_agent_indices: object = None
+    filtered_goals: object = None
+    next_visible_agent_indices: object = None
+    next_filtered_goals: object = None
 
 
 class RolloutBuffer:

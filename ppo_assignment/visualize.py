@@ -55,11 +55,10 @@ def parse_args():
     parser.add_argument("--agents", type=int, default=5)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--max-plan-steps", type=int, default=None)
-    parser.add_argument("--repeated-sync-penalty", type=float, default=0.0)
-    parser.add_argument("--free-syncs-after-object", type=int, default=1)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--candidates", type=int, default=1, help="Run N deterministic episodes and render the best reward.")
+    parser.add_argument("--candidates", type=int, default=1, help="Run N deterministic episodes and render the selected reward.")
+    parser.add_argument("--select", choices=["best", "worst"], default="best", help="Which candidate episode to render.")
     parser.add_argument("--strict-device", action="store_true")
     return parser.parse_args()
 
@@ -76,8 +75,6 @@ def main():
         agents=args.agents,
         hidden_dim=args.hidden_dim,
         max_plan_steps=args.max_plan_steps,
-        repeated_sync_penalty=args.repeated_sync_penalty,
-        free_syncs_after_object=args.free_syncs_after_object,
         device=args.device,
     )
     agent.load(args.checkpoint, load_optimizer=False)
@@ -94,14 +91,14 @@ def main():
             f"macros={result['macros']}"
         )
 
-    best = max(episodes, key=lambda item: item["reward"])
+    selected = max(episodes, key=lambda item: item["reward"]) if args.select == "best" else min(episodes, key=lambda item: item["reward"])
     print(
-        "rendering "
-        f"reward={best['reward']:.3f} "
-        f"steps={best['steps']} "
-        f"macros={best['macros']}"
+        f"rendering {args.select} "
+        f"reward={selected['reward']:.3f} "
+        f"steps={selected['steps']} "
+        f"macros={selected['macros']}"
     )
-    best["env"].render_history()
+    selected["env"].render_history()
 
 
 if __name__ == "__main__":

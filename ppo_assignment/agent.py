@@ -10,10 +10,12 @@ from .controller import (
     candidate_goals_for_agent,
     critic_goals,
     extract_objects,
+    legal_pace_action,
     object_goals,
-    goals_to_actions,
     manhattan,
+    move_towards,
     outward_wall_bump_action,
+    target_exists,
 )
 from .device import resolve_device
 from .models import Actor, Critic
@@ -36,8 +38,6 @@ class AutoregressiveAssignmentPPOAgent:
         entropy_coef=0.01,
         ppo_epochs=4,
         max_plan_steps=None,
-        repeated_sync_penalty=0.0,
-        free_syncs_after_object=1,
     ):
         self.w = w
         self.h = h
@@ -50,8 +50,6 @@ class AutoregressiveAssignmentPPOAgent:
         self.entropy_coef = entropy_coef
         self.ppo_epochs = ppo_epochs
         self.max_plan_steps = max_plan_steps if max_plan_steps is not None else max(h + w, 10)
-        self.repeated_sync_penalty = repeated_sync_penalty
-        self.free_syncs_after_object = free_syncs_after_object
 
         self.actor = Actor(hidden_dim=hidden_dim).to(self.device)
         self.critic = Critic(hidden_dim=hidden_dim).to(self.device)
@@ -67,13 +65,8 @@ class AutoregressiveAssignmentPPOAgent:
 
     def reset_rollout_metrics(self):
         self.rollout_metrics = {
-            "sync_choice_count": 0,
-            "zero_distance_sync_choice_count": 0,
             "goal_choice_count": 0,
-            "sync_bump_completed_count": 0,
-            "sync_reached_but_not_bumped_count": 0,
             "decision_trigger_object_collected": 0,
-            "decision_trigger_goals_completed": 0,
             "decision_trigger_max_plan_steps": 0,
             "remaining_objects_at_episode_end_sum": 0,
             "episode_end_count": 0,
@@ -87,56 +80,143 @@ class AutoregressiveAssignmentPPOAgent:
         self.plan_duration = 0
         self.last_object_count = None
         self.current_macro = None
-        self.sync_bumped = {}
-        self.goal_completed = {}
-        self.sync_usage_counts = {agent_idx: 0 for agent_idx in range(self.agents)}
-        self.pending_sync_bump_agents = set()
+        self.object_bounce_targets = {}
+        self.parity_phase_done = False
+        self.parity_phase = None
+        self._last_world_map = None
 
-    def sync_free_flags(self):
-        return [
-            1.0 if self.sync_usage_counts.get(agent_idx, 0) < self.free_syncs_after_object else 0.0
-            for agent_idx in range(self.agents)
+    def nearest_edge_goal(self, agent_pos, h, w):
+        x, y = agent_pos
+        candidates = [
+            (x, ("edge", 0, y, 0)),
+            (h - 1 - x, ("edge", h - 1, y, 0)),
+            (y, ("edge", x, 0, 0)),
+            (w - 1 - y, ("edge", x, w - 1, 0)),
         ]
+        _, goal = min(candidates, key=lambda item: item[0])
+        return goal
+
+    def initialize_parity_phase(self, agent_locations, h, w):
+        parity_groups = {0: [], 1: []}
+        for agent_idx, (x, y) in enumerate(agent_locations):
+            parity_groups[(x + y) % 2].append(agent_idx)
+
+        if not parity_groups[0] or not parity_groups[1]:
+            self.parity_phase_done = True
+            self.parity_phase = None
+            return
+
+        group_scores = []
+        for parity, agent_indices in parity_groups.items():
+            bump_costs = []
+            for agent_idx in agent_indices:
+                x, y = agent_locations[agent_idx]
+                nearest_edge_distance = min(x, h - 1 - x, y, w - 1 - y)
+                bump_costs.append(nearest_edge_distance + 1)
+            group_scores.append(
+                (
+                    max(bump_costs),
+                    sum(bump_costs),
+                    len(agent_indices),
+                    parity,
+                )
+            )
+
+        _, _, _, selected_parity = min(group_scores)
+        selected_agents = set(parity_groups[selected_parity])
+        ready_agents = set(parity_groups[1 - selected_parity])
+        self.parity_phase = {
+            "selected_agents": selected_agents,
+            "ready_agents": ready_agents,
+            "edge_goals": {
+                agent_idx: self.nearest_edge_goal(agent_locations[agent_idx], h, w)
+                for agent_idx in selected_agents
+            },
+            "completed_agents": set(),
+        }
+
+    def parity_sync_complete(self):
+        if self.parity_phase is None:
+            return self.parity_phase_done
+        return self.parity_phase["completed_agents"] == self.parity_phase["selected_agents"]
+
+    def parity_sync_actions(self, agent_locations, h, w):
+        if self.parity_phase is None:
+            self.initialize_parity_phase(agent_locations, h, w)
+
+        if self.parity_phase_done:
+            return {}
+
+        selected_agents = self.parity_phase["selected_agents"]
+        completed_agents = self.parity_phase["completed_agents"]
+        edge_goals = self.parity_phase["edge_goals"]
+
+        actions = {}
+        for agent_idx, agent_pos in enumerate(agent_locations):
+            if agent_idx not in selected_agents:
+                continue
+            if agent_idx in completed_agents:
+                actions[agent_idx] = legal_pace_action(agent_pos, h, w)
+                continue
+
+            edge_goal = edge_goals[agent_idx]
+            if agent_pos[0] == edge_goal[1] and agent_pos[1] == edge_goal[2]:
+                actions[agent_idx] = outward_wall_bump_action(edge_goal, h, w)
+                completed_agents.add(agent_idx)
+            else:
+                actions[agent_idx] = move_towards(agent_pos, edge_goal, h, w)
+
+        return actions
+
+    def parity_ready_indices(self):
+        if self.parity_phase is None:
+            return []
+        return sorted(self.parity_phase["ready_agents"])
+
+    @staticmethod
+    def filter_object_goals(world_map, max_level):
+        return [goal for goal in object_goals(world_map) if goal[3] <= max_level]
+
+    @staticmethod
+    def visible_state(state, visible_agent_indices):
+        world_map, agent_locations = state
+        return world_map, [agent_locations[agent_idx] for agent_idx in visible_agent_indices]
 
     def action(self, state, deterministic=False):
         world_map, agent_locations = state
+        h = len(world_map)
+        w = len(world_map[0]) if h > 0 else self.w
+        num_agents = len(agent_locations)
         objects = extract_objects(world_map)
         current_object_count = len(objects)
 
-        if self.active_plan is not None:
-            for agent_idx, goal in self.active_plan.items():
-                if goal[0] == "object" and manhattan(agent_locations[agent_idx], goal) == 0:
-                    self.goal_completed[agent_idx] = True
-
         if current_object_count == 0:
             self.last_object_count = current_object_count
-            return [random.randrange(0, 4) for _ in agent_locations]
+            return [legal_pace_action(agent_pos, h, w) for agent_pos in agent_locations]
 
         object_collected = (
             self.last_object_count is not None
             and current_object_count < self.last_object_count
         )
-        if object_collected:
-            self.sync_usage_counts = {agent_idx: 0 for agent_idx in range(self.agents)}
 
-        goals_completed = (
-            self.active_plan is not None
-            and current_object_count > 0
-            and all(self.goal_completed.get(agent_idx, False) for agent_idx in self.active_plan)
-        )
+        if not self.parity_phase_done:
+            return self.parity_phase_actions(
+                state,
+                deterministic=deterministic,
+                object_collected=object_collected,
+                current_object_count=current_object_count,
+            )
+
         max_plan_steps_reached = self.active_plan is not None and self.plan_duration >= self.max_plan_steps
         need_decision = (
             self.active_plan is None
             or object_collected
-            or goals_completed
             or max_plan_steps_reached
         )
 
         if need_decision:
             if object_collected:
                 self.rollout_metrics["decision_trigger_object_collected"] += 1
-            if goals_completed:
-                self.rollout_metrics["decision_trigger_goals_completed"] += 1
             if max_plan_steps_reached:
                 self.rollout_metrics["decision_trigger_max_plan_steps"] += 1
 
@@ -144,88 +224,170 @@ class AutoregressiveAssignmentPPOAgent:
                 self.close_current_macro(next_state=state, done=False)
 
             with torch.no_grad():
-                decision_sync_free = self.sync_free_flags()
                 active_plan, target_indices, agent_order, joint_logprob, joint_entropy = self.make_assignment_decision(
                     state,
                     deterministic=deterministic,
-                    sync_free=decision_sync_free,
                 )
-                goals = critic_goals(world_map, agent_locations, self.h, self.w)
-                value = self.critic(state, self.h, self.w, self.agents, goals, sync_free=decision_sync_free)
+                goals = critic_goals(world_map, agent_locations, h, w)
+                value = self.critic(state, h, w, num_agents, goals)
 
             self.active_plan = active_plan
-            repeated_sync_penalty = 0.0
             self.rollout_metrics["goal_choice_count"] += len(active_plan)
-            for agent_idx, goal in active_plan.items():
-                if goal[0] == "sync":
-                    usage_count = self.sync_usage_counts.get(agent_idx, 0) + 1
-                    self.sync_usage_counts[agent_idx] = usage_count
-                    if usage_count > self.free_syncs_after_object:
-                        repeated_sync_penalty += self.repeated_sync_penalty * usage_count
-                    self.rollout_metrics["sync_choice_count"] += 1
-                    if manhattan(agent_locations[agent_idx], goal) == 0:
-                        self.rollout_metrics["zero_distance_sync_choice_count"] += 1
-            self.sync_bumped = {
-                agent_idx: False
-                for agent_idx, goal in active_plan.items()
-                if goal[0] == "sync"
-            }
-            self.goal_completed = {agent_idx: False for agent_idx in active_plan}
-            self.pending_sync_bump_agents = set()
+            self.object_bounce_targets = {}
             self.current_macro = {
+                "mode": "normal",
                 "decision_state": self.copy_state(state),
+                "visible_agent_indices": None,
+                "filtered_goals": None,
                 "agent_order": list(agent_order),
                 "targets": copy.deepcopy(active_plan),
                 "target_indices": copy.deepcopy(target_indices),
                 "old_joint_logprob": float(joint_logprob.detach().cpu().item()),
                 "old_value": float(value.detach().cpu().item()),
                 "old_entropy": float(joint_entropy.detach().cpu().item()),
-                "macro_reward": -repeated_sync_penalty,
+                "macro_reward": 0.0,
                 "duration": 0,
-                "decision_sync_free": decision_sync_free,
             }
             self.plan_duration = 0
 
-        primitive_actions = self.goals_to_primitive_actions(agent_locations)
+        self._last_world_map = world_map
+        primitive_actions = self.goals_to_primitive_actions(agent_locations, h, w)
         self.last_object_count = current_object_count
         return primitive_actions
 
-    def goals_to_primitive_actions(self, agent_locations):
+    def parity_phase_actions(self, state, deterministic, object_collected, current_object_count):
+        world_map, agent_locations = state
+        h = len(world_map)
+        w = len(world_map[0]) if h > 0 else self.w
+        if self.parity_phase is None:
+            self.initialize_parity_phase(agent_locations, h, w)
+
+        if self.parity_phase_done:
+            return self.action(state, deterministic=deterministic)
+
+        sync_complete = self.parity_sync_complete()
+        max_plan_steps_reached = self.current_macro is not None and self.plan_duration >= self.max_plan_steps
+        if self.current_macro is not None and (
+            object_collected or sync_complete or max_plan_steps_reached
+        ):
+            if sync_complete:
+                self.parity_phase_done = True
+                self.parity_phase = None
+            if object_collected:
+                self.rollout_metrics["decision_trigger_object_collected"] += 1
+            if max_plan_steps_reached:
+                self.rollout_metrics["decision_trigger_max_plan_steps"] += 1
+            self.close_current_macro(next_state=state, done=False)
+            self.active_plan = None
+            self.object_bounce_targets = {}
+
+        if sync_complete:
+            self.parity_phase_done = True
+            self.parity_phase = None
+            return self.action(state, deterministic=deterministic)
+
+        sync_actions = self.parity_sync_actions(agent_locations, h, w)
+        ready_indices = self.parity_ready_indices()
+        filtered_goals = self.filter_object_goals(world_map, len(ready_indices))
+
+        if self.current_macro is None and ready_indices and filtered_goals:
+            with torch.no_grad():
+                active_plan, target_indices, agent_order, joint_logprob, joint_entropy = self.make_assignment_decision(
+                    state,
+                    deterministic=deterministic,
+                    visible_agent_indices=ready_indices,
+                    filtered_goals=filtered_goals,
+                )
+                value_state = self.visible_state(state, ready_indices)
+                value = self.critic(value_state, h, w, len(ready_indices), filtered_goals)
+
+            self.active_plan = active_plan
+            self.rollout_metrics["goal_choice_count"] += len(active_plan)
+            self.object_bounce_targets = {}
+            self.current_macro = {
+                "mode": "parity_ready_subproblem",
+                "decision_state": self.copy_state(state),
+                "visible_agent_indices": list(ready_indices),
+                "filtered_goals": copy.deepcopy(filtered_goals),
+                "agent_order": list(agent_order),
+                "targets": copy.deepcopy(active_plan),
+                "target_indices": copy.deepcopy(target_indices),
+                "old_joint_logprob": float(joint_logprob.detach().cpu().item()),
+                "old_value": float(value.detach().cpu().item()),
+                "old_entropy": float(joint_entropy.detach().cpu().item()),
+                "macro_reward": 0.0,
+                "duration": 0,
+            }
+            self.plan_duration = 0
+
+        self._last_world_map = world_map
+        ready_actions = self.goals_to_primitive_actions(agent_locations, h, w)
         actions = []
-        self.pending_sync_bump_agents.clear()
+        for agent_idx, agent_pos in enumerate(agent_locations):
+            if agent_idx in sync_actions:
+                actions.append(sync_actions[agent_idx])
+            elif agent_idx in ready_indices:
+                actions.append(ready_actions[agent_idx])
+            else:
+                actions.append(legal_pace_action(agent_pos, h, w))
+
+        self.last_object_count = current_object_count
+        return actions
+
+    def goals_to_primitive_actions(self, agent_locations, h=None, w=None):
+        if h is None:
+            h = self.h
+        if w is None:
+            w = self.w
+        actions = []
         for agent_idx, agent_pos in enumerate(agent_locations):
             goal = self.active_plan.get(agent_idx) if self.active_plan else None
             if goal is None:
-                actions.append(random.randrange(0, 4))
+                actions.append(legal_pace_action(agent_pos, h, w))
                 continue
 
-            if (
-                goal[0] == "sync"
-                and not self.sync_bumped.get(agent_idx, False)
-                and manhattan(agent_pos, goal) == 0
-            ):
-                actions.append(outward_wall_bump_action(goal, self.h, self.w))
-                self.pending_sync_bump_agents.add(agent_idx)
-                self.rollout_metrics["sync_reached_but_not_bumped_count"] += 1
+            if agent_idx in self.object_bounce_targets:
+                bounce_goal = self.object_bounce_targets.pop(agent_idx)
+                actions.append(move_towards(agent_pos, bounce_goal, h, w))
+            elif target_exists(self._last_world_map, goal[1:]) and manhattan(agent_pos, goal) == 0:
+                action = legal_pace_action(agent_pos, h, w)
+                actions.append(action)
+                self.object_bounce_targets[agent_idx] = goal
             else:
-                actions.append(goals_to_actions([agent_pos], {0: goal}, self.h, self.w)[0])
+                actions.append(move_towards(agent_pos, goal, h, w))
         return actions
 
-    def make_assignment_decision(self, state, deterministic=False, sync_free=None):
+    def make_assignment_decision(self, state, deterministic=False, visible_agent_indices=None, filtered_goals=None):
         world_map, agent_locations = state
-        encoder_goals = critic_goals(world_map, agent_locations, self.h, self.w)
-        if not encoder_goals:
-            return {}, {}, list(range(len(agent_locations))), torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
-
-        agent_embeddings, goal_embeddings, global_embedding = self.actor.encode_state(
-            state,
-            self.h,
-            self.w,
-            self.agents,
-            encoder_goals,
-            sync_free=sync_free,
+        h = len(world_map)
+        w = len(world_map[0]) if h > 0 else self.w
+        if visible_agent_indices is None:
+            visible_agent_indices = list(range(len(agent_locations)))
+        else:
+            visible_agent_indices = list(visible_agent_indices)
+        visible_locations = [agent_locations[agent_idx] for agent_idx in visible_agent_indices]
+        original_to_local = {
+            agent_idx: local_idx
+            for local_idx, agent_idx in enumerate(visible_agent_indices)
+        }
+        num_agents = len(visible_locations)
+        encoder_goals = (
+            list(filtered_goals)
+            if filtered_goals is not None
+            else critic_goals(world_map, visible_locations, h, w)
         )
-        agent_order = list(range(len(agent_locations)))
+        if not encoder_goals:
+            return {}, {}, list(visible_agent_indices), torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
+
+        actor_state = (world_map, visible_locations)
+        agent_embeddings, goal_embeddings, global_embedding = self.actor.encode_state(
+            actor_state,
+            h,
+            w,
+            num_agents,
+            encoder_goals,
+        )
+        agent_order = list(visible_agent_indices)
         if deterministic:
             agent_order.sort()
         else:
@@ -238,20 +400,25 @@ class AutoregressiveAssignmentPPOAgent:
         joint_entropy = torch.tensor(0.0, device=self.device)
 
         for step_idx, agent_idx in enumerate(agent_order):
-            candidate_goals = candidate_goals_for_agent(world_map, agent_locations[agent_idx], self.h, self.w)
+            local_agent_idx = original_to_local[agent_idx]
+            candidate_goals = (
+                list(filtered_goals)
+                if filtered_goals is not None
+                else candidate_goals_for_agent(world_map, agent_locations[agent_idx], h, w)
+            )
             candidate_goal_indices = [encoder_goals.index(goal) for goal in candidate_goals]
             logits = self.actor.decision_logits(
-                agent_idx,
+                local_agent_idx,
                 step_idx,
                 previous_decision_tokens,
-                agent_locations,
+                visible_locations,
                 candidate_goals,
                 agent_embeddings,
                 goal_embeddings[candidate_goal_indices],
                 global_embedding,
-                self.h,
-                self.w,
-                self.agents,
+                h,
+                w,
+                num_agents,
             )
             dist = Categorical(logits=logits)
             if deterministic:
@@ -265,34 +432,27 @@ class AutoregressiveAssignmentPPOAgent:
             joint_entropy = joint_entropy + dist.entropy()
             previous_decision_tokens.append(
                 self.actor.build_previous_decision_token(
-                    agent_idx,
+                    local_agent_idx,
                     candidate_goal_indices[goal_idx_int],
                     step_idx,
-                    agent_locations,
+                    visible_locations,
                     encoder_goals,
                     agent_embeddings,
                     goal_embeddings,
-                    self.h,
-                    self.w,
-                    self.agents,
+                    h,
+                    w,
+                    num_agents,
                 )
             )
 
         return targets, target_indices, agent_order, joint_logprob, joint_entropy
 
     def reward(self, reward):
-        for agent_idx in self.pending_sync_bump_agents:
-            if agent_idx in self.sync_bumped and not self.sync_bumped[agent_idx]:
-                self.sync_bumped[agent_idx] = True
-                self.goal_completed[agent_idx] = True
-                self.rollout_metrics["sync_bump_completed_count"] += 1
-        self.pending_sync_bump_agents.clear()
-
         if self.current_macro is not None:
             duration = self.current_macro["duration"]
             self.current_macro["macro_reward"] += (self.gamma ** duration) * float(reward)
             self.current_macro["duration"] += 1
-        self.plan_duration += 1
+            self.plan_duration += 1
 
     def finish_episode(self, final_state):
         if self.current_macro is not None:
@@ -301,12 +461,20 @@ class AutoregressiveAssignmentPPOAgent:
         self.rollout_metrics["episode_end_count"] += 1
         self.active_plan = None
         self.current_macro = None
-        self.sync_bumped = {}
-        self.goal_completed = {}
-        self.pending_sync_bump_agents = set()
+        self.object_bounce_targets = {}
 
     def close_current_macro(self, next_state, done):
         macro = self.current_macro
+        next_visible_agent_indices = None
+        next_filtered_goals = None
+        if (
+            not done
+            and macro.get("mode") == "parity_ready_subproblem"
+            and not self.parity_phase_done
+            and self.parity_phase is not None
+        ):
+            next_visible_agent_indices = self.parity_ready_indices()
+            next_filtered_goals = self.filter_object_goals(next_state[0], len(next_visible_agent_indices))
         self.rollout_buffer.add(
             MacroTransition(
                 decision_state=macro["decision_state"],
@@ -320,33 +488,65 @@ class AutoregressiveAssignmentPPOAgent:
                 duration=int(macro["duration"]),
                 next_decision_state=self.copy_state(next_state),
                 done=bool(done),
-                decision_sync_free=list(macro["decision_sync_free"]),
-                next_decision_sync_free=self.sync_free_flags(),
+                mode=macro.get("mode", "normal"),
+                visible_agent_indices=copy.deepcopy(macro.get("visible_agent_indices")),
+                filtered_goals=copy.deepcopy(macro.get("filtered_goals")),
+                next_visible_agent_indices=copy.deepcopy(next_visible_agent_indices),
+                next_filtered_goals=copy.deepcopy(next_filtered_goals),
             )
         )
         self.current_macro = None
 
-    def recompute_logprob(self, decision_state, agent_order, targets, target_indices=None, sync_free=None):
+    def recompute_logprob(
+        self,
+        decision_state,
+        agent_order,
+        targets,
+        target_indices=None,
+        visible_agent_indices=None,
+        filtered_goals=None,
+    ):
         world_map, agent_locations = decision_state
-        encoder_goals = critic_goals(world_map, agent_locations, self.h, self.w)
+        h = len(world_map)
+        w = len(world_map[0]) if h > 0 else self.w
+        if visible_agent_indices is None:
+            visible_agent_indices = list(range(len(agent_locations)))
+        else:
+            visible_agent_indices = list(visible_agent_indices)
+        visible_locations = [agent_locations[agent_idx] for agent_idx in visible_agent_indices]
+        original_to_local = {
+            agent_idx: local_idx
+            for local_idx, agent_idx in enumerate(visible_agent_indices)
+        }
+        num_agents = len(visible_locations)
+        encoder_goals = (
+            list(filtered_goals)
+            if filtered_goals is not None
+            else critic_goals(world_map, visible_locations, h, w)
+        )
         if not encoder_goals:
             return torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
 
+        actor_state = (world_map, visible_locations)
         agent_embeddings, goal_embeddings, global_embedding = self.actor.encode_state(
-            decision_state,
-            self.h,
-            self.w,
-            self.agents,
+            actor_state,
+            h,
+            w,
+            num_agents,
             encoder_goals,
-            sync_free=sync_free,
         )
         previous_decision_tokens = []
         new_joint_logprob = torch.tensor(0.0, device=self.device)
         new_entropy = torch.tensor(0.0, device=self.device)
 
         for step_idx, agent_idx in enumerate(agent_order):
+            local_agent_idx = original_to_local[agent_idx]
             stored_target = targets[agent_idx]
-            candidate_goals = candidate_goals_for_agent(world_map, agent_locations[agent_idx], self.h, self.w)
+            candidate_goals = (
+                list(filtered_goals)
+                if filtered_goals is not None
+                else candidate_goals_for_agent(world_map, agent_locations[agent_idx], h, w)
+            )
             candidate_goal_indices = [encoder_goals.index(goal) for goal in candidate_goals]
             if target_indices is None:
                 try:
@@ -362,17 +562,17 @@ class AutoregressiveAssignmentPPOAgent:
                     )
 
             logits = self.actor.decision_logits(
-                agent_idx,
+                local_agent_idx,
                 step_idx,
                 previous_decision_tokens,
-                agent_locations,
+                visible_locations,
                 candidate_goals,
                 agent_embeddings,
                 goal_embeddings[candidate_goal_indices],
                 global_embedding,
-                self.h,
-                self.w,
-                self.agents,
+                h,
+                w,
+                num_agents,
             )
             dist = Categorical(logits=logits)
             action_tensor = torch.tensor(stored_candidate_goal_idx, dtype=torch.long, device=self.device)
@@ -380,16 +580,16 @@ class AutoregressiveAssignmentPPOAgent:
             new_entropy = new_entropy + dist.entropy()
             previous_decision_tokens.append(
                 self.actor.build_previous_decision_token(
-                    agent_idx,
+                    local_agent_idx,
                     candidate_goal_indices[stored_candidate_goal_idx],
                     step_idx,
-                    agent_locations,
+                    visible_locations,
                     encoder_goals,
                     agent_embeddings,
                     goal_embeddings,
-                    self.h,
-                    self.w,
-                    self.agents,
+                    h,
+                    w,
+                    num_agents,
                 )
             )
 
@@ -397,20 +597,37 @@ class AutoregressiveAssignmentPPOAgent:
 
     def recompute_logprob_batch(self, transitions):
         states = [transition.decision_state for transition in transitions]
-        sync_free_batch = [transition.decision_sync_free for transition in transitions]
-        encoder_goals_batch = [critic_goals(state[0], state[1], self.h, self.w) for state in states]
-        if not encoder_goals_batch or len(encoder_goals_batch[0]) == 0:
+        h = len(states[0][0])
+        w = len(states[0][0][0]) if h > 0 else self.w
+        visible_indices_batch = [
+            list(range(len(state[1]))) if transition.visible_agent_indices is None else list(transition.visible_agent_indices)
+            for state, transition in zip(states, transitions)
+        ]
+        visible_locations_batch = [
+            [state[1][agent_idx] for agent_idx in visible_indices]
+            for state, visible_indices in zip(states, visible_indices_batch)
+        ]
+        num_agents = len(visible_locations_batch[0])
+        encoder_goals_batch = [
+            list(transition.filtered_goals)
+            if transition.filtered_goals is not None
+            else critic_goals(state[0], visible_locations, h, w)
+            for state, visible_locations, transition in zip(states, visible_locations_batch, transitions)
+        ]
+        if not encoder_goals_batch or len(encoder_goals_batch[0]) == 0 or num_agents == 0:
             zeros = torch.zeros(len(transitions), dtype=torch.float32, device=self.device)
             return zeros, zeros
 
-        agent_locations_batch = [state[1] for state in states]
+        actor_states = [
+            (state[0], visible_locations)
+            for state, visible_locations in zip(states, visible_locations_batch)
+        ]
         agent_embeddings, goal_embeddings, global_embedding = self.actor.encode_states_batch(
-            states,
-            self.h,
-            self.w,
-            self.agents,
+            actor_states,
+            h,
+            w,
+            num_agents,
             encoder_goals_batch,
-            sync_free_batch=sync_free_batch,
         )
 
         previous_decision_tokens = []
@@ -418,18 +635,26 @@ class AutoregressiveAssignmentPPOAgent:
         new_joint_logprob = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
         new_entropy = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
 
-        for step_idx in range(self.agents):
+        for step_idx in range(num_agents):
             agent_indices_all = [transition.agent_order[step_idx] for transition in transitions]
+            local_agent_indices_all = [
+                visible_indices_batch[row].index(agent_indices_all[row])
+                for row in range(batch_size)
+            ]
             stored_candidate_goal_indices_all = []
             candidate_goals_batch_all = []
             candidate_encoder_indices_batch_all = []
             for row, transition in enumerate(transitions):
                 stored_target = transition.targets[agent_indices_all[row]]
-                candidate_goals = candidate_goals_for_agent(
-                    states[row][0],
-                    agent_locations_batch[row][agent_indices_all[row]],
-                    self.h,
-                    self.w,
+                candidate_goals = (
+                    list(transition.filtered_goals)
+                    if transition.filtered_goals is not None
+                    else candidate_goals_for_agent(
+                        states[row][0],
+                        states[row][1][agent_indices_all[row]],
+                        h,
+                        w,
+                    )
                 )
                 candidate_encoder_indices = [encoder_goals_batch[row].index(goal) for goal in candidate_goals]
                 candidate_goals_batch_all.append(candidate_goals)
@@ -451,17 +676,17 @@ class AutoregressiveAssignmentPPOAgent:
                 dim=0,
             )
             logits = self.actor.decision_logits_batch(
-                agent_indices_all,
+                local_agent_indices_all,
                 step_idx,
                 previous_decision_tokens,
-                agent_locations_batch,
+                visible_locations_batch,
                 candidate_goals_batch_all,
                 agent_embeddings,
                 candidate_goal_embeddings,
                 global_embedding,
-                self.h,
-                self.w,
-                self.agents,
+                h,
+                w,
+                num_agents,
             )
             dist = Categorical(logits=logits)
             action_tensor = torch.tensor(stored_candidate_goal_indices_all, dtype=torch.long, device=self.device)
@@ -471,44 +696,62 @@ class AutoregressiveAssignmentPPOAgent:
                 selected_encoder_goal_indices[row] = candidate_encoder_indices_batch_all[row][stored_candidate_goal_indices_all[row]]
 
             token_batch = self.actor.build_previous_decision_tokens_batch(
-                agent_indices_all,
+                local_agent_indices_all,
                 selected_encoder_goal_indices,
                 step_idx,
-                agent_locations_batch,
+                visible_locations_batch,
                 encoder_goals_batch,
                 agent_embeddings,
                 goal_embeddings,
-                self.h,
-                self.w,
-                self.agents,
+                h,
+                w,
+                num_agents,
             )
             previous_decision_tokens.append(token_batch)
 
         return new_joint_logprob, new_entropy
 
-    def critic_values_batch(self, states, sync_free_batch=None):
+    def critic_values_batch(self, states, visible_agent_indices_batch=None, filtered_goals_batch=None):
         if not states:
             return torch.empty(0, dtype=torch.float32, device=self.device)
 
         values = [None] * len(states)
         groups = defaultdict(list)
         goals_cache = []
+        visible_locations_cache = []
         for idx, state in enumerate(states):
-            goals = critic_goals(state[0], state[1], self.h, self.w)
+            h = len(state[0])
+            w = len(state[0][0]) if h > 0 else self.w
+            visible_agent_indices = (
+                list(range(len(state[1])))
+                if visible_agent_indices_batch is None or visible_agent_indices_batch[idx] is None
+                else list(visible_agent_indices_batch[idx])
+            )
+            visible_locations = [state[1][agent_idx] for agent_idx in visible_agent_indices]
+            goals = (
+                object_goals(state[0])
+                if filtered_goals_batch is None or filtered_goals_batch[idx] is None
+                else list(filtered_goals_batch[idx])
+            )
             goals_cache.append(goals)
-            groups[len(goals)].append(idx)
+            visible_locations_cache.append(visible_locations)
+            if not visible_locations or not goals:
+                values[idx] = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+            else:
+                groups[(h, w, len(visible_locations), len(goals))].append(idx)
 
-        for indices in groups.values():
-            group_states = [states[idx] for idx in indices]
+        for (h, w, num_agents, _), indices in groups.items():
+            group_states = [
+                (states[idx][0], visible_locations_cache[idx])
+                for idx in indices
+            ]
             group_goals = [goals_cache[idx] for idx in indices]
-            group_sync_free = None if sync_free_batch is None else [sync_free_batch[idx] for idx in indices]
             group_values = self.critic.forward_batch(
                 group_states,
-                self.h,
-                self.w,
-                self.agents,
+                h,
+                w,
+                num_agents,
                 group_goals,
-                sync_free_batch=group_sync_free,
             )
             for offset, original_idx in enumerate(indices):
                 values[original_idx] = group_values[offset]
@@ -520,7 +763,20 @@ class AutoregressiveAssignmentPPOAgent:
         entropies = [None] * len(transitions)
         groups = defaultdict(list)
         for idx, transition in enumerate(transitions):
-            groups[len(object_goals(transition.decision_state[0]))].append(idx)
+            world_map, agent_locations = transition.decision_state
+            h = len(world_map)
+            w = len(world_map[0]) if h > 0 else self.w
+            visible_count = (
+                len(agent_locations)
+                if transition.visible_agent_indices is None
+                else len(transition.visible_agent_indices)
+            )
+            goal_count = (
+                len(object_goals(world_map))
+                if transition.filtered_goals is None
+                else len(transition.filtered_goals)
+            )
+            groups[(h, w, visible_count, goal_count)].append(idx)
 
         self._last_recompute_batches = len(groups)
         self._last_avg_recompute_batch_size = len(transitions) / max(len(groups), 1)
@@ -532,6 +788,12 @@ class AutoregressiveAssignmentPPOAgent:
                 entropies[original_idx] = group_entropies[offset]
 
         return torch.stack(logprobs), torch.stack(entropies)
+
+    @staticmethod
+    def transition_candidate_count(transition):
+        if transition.filtered_goals is not None:
+            return len(transition.filtered_goals)
+        return len(object_goals(transition.decision_state[0]))
 
     def train_update(self):
         if len(self.rollout_buffer) == 0:
@@ -546,7 +808,8 @@ class AutoregressiveAssignmentPPOAgent:
             critic_start = time.perf_counter()
             next_values = self.critic_values_batch(
                 [transition.next_decision_state for transition in transitions],
-                sync_free_batch=[transition.next_decision_sync_free for transition in transitions],
+                visible_agent_indices_batch=[transition.next_visible_agent_indices for transition in transitions],
+                filtered_goals_batch=[transition.next_filtered_goals for transition in transitions],
             )
             critic_value_sec += time.perf_counter() - critic_start
             macro_rewards = torch.tensor(
@@ -589,7 +852,8 @@ class AutoregressiveAssignmentPPOAgent:
             critic_start = time.perf_counter()
             new_value_tensor = self.critic_values_batch(
                 [transition.decision_state for transition in transitions],
-                sync_free_batch=[transition.decision_sync_free for transition in transitions],
+                visible_agent_indices_batch=[transition.visible_agent_indices for transition in transitions],
+                filtered_goals_batch=[transition.filtered_goals for transition in transitions],
             )
             critic_value_sec += time.perf_counter() - critic_start
             old_logprob_tensor = torch.tensor(
@@ -629,9 +893,9 @@ class AutoregressiveAssignmentPPOAgent:
                 "recompute_logprob_sec": recompute_logprob_sec,
                 "critic_value_sec": critic_value_sec,
                 "num_macro_transitions": len(transitions),
-                "avg_candidate_count": sum(len(object_goals(t.decision_state[0])) + 4 for t in transitions) / len(transitions),
-                "min_candidate_count": min(len(object_goals(t.decision_state[0])) + 4 for t in transitions),
-                "max_candidate_count": max(len(object_goals(t.decision_state[0])) + 4 for t in transitions),
+                "avg_candidate_count": sum(self.transition_candidate_count(t) for t in transitions) / len(transitions),
+                "min_candidate_count": min(self.transition_candidate_count(t) for t in transitions),
+                "max_candidate_count": max(self.transition_candidate_count(t) for t in transitions),
                 "recompute_batches": self._last_recompute_batches,
                 "avg_recompute_batch_size": self._last_avg_recompute_batch_size,
             }
@@ -656,8 +920,6 @@ class AutoregressiveAssignmentPPOAgent:
                     "entropy_coef": self.entropy_coef,
                     "ppo_epochs": self.ppo_epochs,
                     "max_plan_steps": self.max_plan_steps,
-                    "repeated_sync_penalty": self.repeated_sync_penalty,
-                    "free_syncs_after_object": self.free_syncs_after_object,
                 },
             }
         checkpoint.update(metadata)

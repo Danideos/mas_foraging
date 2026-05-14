@@ -2,6 +2,7 @@ import argparse
 import copy
 import csv
 import json
+import math
 import os
 import random
 import re
@@ -36,13 +37,8 @@ _WORKER_AGENT = None
 
 
 ROLLOUT_METRIC_COUNT_KEYS = [
-    "sync_choice_count",
-    "zero_distance_sync_choice_count",
     "goal_choice_count",
-    "sync_bump_completed_count",
-    "sync_reached_but_not_bumped_count",
     "decision_trigger_object_collected",
-    "decision_trigger_goals_completed",
     "decision_trigger_max_plan_steps",
     "remaining_objects_at_episode_end_sum",
     "episode_end_count",
@@ -50,12 +46,7 @@ ROLLOUT_METRIC_COUNT_KEYS = [
 
 
 ROLLOUT_METRIC_FIELDNAMES = [
-    "sync_choice_rate",
-    "zero_distance_sync_choice_rate",
-    "sync_bump_completed_count",
-    "sync_reached_but_not_bumped_count",
     "decision_trigger_object_collected",
-    "decision_trigger_goals_completed",
     "decision_trigger_max_plan_steps",
     "remaining_objects_at_episode_end",
 ]
@@ -102,6 +93,96 @@ def run_episode(env, agent, deterministic=False, train=True):
     return total_reward, steps, macro_count
 
 
+def validate_env_args(h, w, objects, agents):
+    if h <= 0 or w <= 0:
+        raise ValueError(f"Environment dimensions must be positive, got h={h}, w={w}.")
+    if agents < 2:
+        raise ValueError(f"ForagingEnvironment requires at least 2 agents, got {agents}.")
+    if objects < 1:
+        raise ValueError(f"At least 1 object is required, got {objects}.")
+    cells = h * w
+    if agents + objects > cells:
+        raise ValueError(
+            f"Too many entities for board: agents + objects = {agents + objects}, cells = {cells}."
+        )
+
+
+def normalize_sampling_args(args):
+    defaults = {
+        "min_height": args.height,
+        "max_height_train": args.height,
+        "min_width": args.width,
+        "max_width_train": args.width,
+        "min_agents": args.agents,
+        "max_agents_train": args.agents,
+        "min_objects": args.objects,
+        "max_objects_train": args.objects,
+    }
+    for key, value in defaults.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
+
+
+def make_sampler_config(args):
+    return {
+        "min_height": args.min_height,
+        "max_height_train": args.max_height_train,
+        "min_width": args.min_width,
+        "max_width_train": args.max_width_train,
+        "min_agents": args.min_agents,
+        "max_agents_train": args.max_agents_train,
+        "min_objects": args.min_objects,
+        "max_objects_train": args.max_objects_train,
+        "min_occupancy": args.min_occupancy,
+        "max_occupancy": args.max_occupancy,
+        "min_objects_per_agent": args.min_objects_per_agent,
+        "max_objects_per_agent": args.max_objects_per_agent,
+    }
+
+
+def sample_env_args(config):
+    for _ in range(1000):
+        h = random.randint(config["min_height"], config["max_height_train"])
+        w = random.randint(config["min_width"], config["max_width_train"])
+        cells = h * w
+
+        min_total = math.ceil(config["min_occupancy"] * cells)
+        max_total = math.floor(config["max_occupancy"] * cells)
+
+        max_agents = min(config["max_agents_train"], max_total - 1)
+        if max_agents < config["min_agents"]:
+            continue
+
+        agents = random.randint(config["min_agents"], max_agents)
+
+        min_objects = max(
+            config["min_objects"],
+            math.ceil(config["min_objects_per_agent"] * agents),
+            min_total - agents,
+        )
+        max_objects = min(
+            config["max_objects_train"],
+            math.floor(config["max_objects_per_agent"] * agents),
+            cells - agents,
+            max_total - agents,
+        )
+
+        if max_objects < min_objects:
+            continue
+
+        objects = random.randint(min_objects, max_objects)
+        validate_env_args(h, w, objects, agents)
+        return h, w, objects, agents
+
+    raise RuntimeError("Could not sample a valid environment after 1000 attempts.")
+
+
+def make_env_args(env_source):
+    if isinstance(env_source, dict):
+        return sample_env_args(env_source)
+    return env_source
+
+
 def empty_rollout_metric_counts():
     return {key: 0 for key in ROLLOUT_METRIC_COUNT_KEYS}
 
@@ -113,18 +194,9 @@ def add_rollout_metric_counts(total, chunk):
 
 
 def finalize_rollout_metrics(counts):
-    goal_choices = counts.get("goal_choice_count", 0)
-    sync_choices = counts.get("sync_choice_count", 0)
     episode_count = counts.get("episode_end_count", 0)
     return {
-        "sync_choice_rate": 0.0 if goal_choices == 0 else counts.get("sync_choice_count", 0) / goal_choices,
-        "zero_distance_sync_choice_rate": 0.0
-        if sync_choices == 0
-        else counts.get("zero_distance_sync_choice_count", 0) / sync_choices,
-        "sync_bump_completed_count": counts.get("sync_bump_completed_count", 0),
-        "sync_reached_but_not_bumped_count": counts.get("sync_reached_but_not_bumped_count", 0),
         "decision_trigger_object_collected": counts.get("decision_trigger_object_collected", 0),
-        "decision_trigger_goals_completed": counts.get("decision_trigger_goals_completed", 0),
         "decision_trigger_max_plan_steps": counts.get("decision_trigger_max_plan_steps", 0),
         "remaining_objects_at_episode_end": 0.0
         if episode_count == 0
@@ -154,7 +226,7 @@ def evaluate_agent(env_args, agent, episodes, deterministic=True, seed=None):
     macros = []
     try:
         for _ in range(episodes):
-            env = ForagingEnvironment(*env_args)
+            env = ForagingEnvironment(*make_env_args(env_args))
             reward, length, macro_count = run_episode(
                 env,
                 agent,
@@ -188,9 +260,9 @@ def cpu_state_dict(module):
 
 def make_agent_kwargs(args, device):
     return {
-        "w": args.width,
-        "h": args.height,
-        "agents": args.agents,
+        "w": args.max_width_train,
+        "h": args.max_height_train,
+        "agents": args.max_agents_train,
         "device": device,
         "hidden_dim": args.hidden_dim,
         "gamma": args.gamma,
@@ -201,8 +273,6 @@ def make_agent_kwargs(args, device):
         "entropy_coef": args.entropy_coef,
         "ppo_epochs": args.ppo_epochs,
         "max_plan_steps": args.max_plan_steps,
-        "repeated_sync_penalty": args.repeated_sync_penalty,
-        "free_syncs_after_object": args.free_syncs_after_object,
     }
 
 
@@ -238,8 +308,11 @@ def transition_to_plain(t):
         "duration": int(t.duration),
         "next_decision_state": copy.deepcopy(t.next_decision_state),
         "done": bool(t.done),
-        "decision_sync_free": copy.deepcopy(t.decision_sync_free),
-        "next_decision_sync_free": copy.deepcopy(t.next_decision_sync_free),
+        "mode": t.mode,
+        "visible_agent_indices": copy.deepcopy(t.visible_agent_indices),
+        "filtered_goals": copy.deepcopy(t.filtered_goals),
+        "next_visible_agent_indices": copy.deepcopy(t.next_visible_agent_indices),
+        "next_filtered_goals": copy.deepcopy(t.next_filtered_goals),
     }
 
 
@@ -256,8 +329,11 @@ def transition_from_plain(d):
         duration=int(d["duration"]),
         next_decision_state=d["next_decision_state"],
         done=bool(d["done"]),
-        decision_sync_free=d["decision_sync_free"],
-        next_decision_sync_free=d["next_decision_sync_free"],
+        mode=d.get("mode", "normal"),
+        visible_agent_indices=d.get("visible_agent_indices"),
+        filtered_goals=d.get("filtered_goals"),
+        next_visible_agent_indices=d.get("next_visible_agent_indices"),
+        next_filtered_goals=d.get("next_filtered_goals"),
     )
 
 
@@ -277,7 +353,7 @@ def rollout_worker(actor_state, critic_state, seed, episodes, worker_transport):
     lengths = []
     macros = []
     for _ in range(episodes):
-        env = ForagingEnvironment(*_WORKER_ENV_ARGS)
+        env = ForagingEnvironment(*make_env_args(_WORKER_ENV_ARGS))
         reward, length, macro_count = run_episode(env, _WORKER_AGENT, deterministic=False, train=True)
         rewards.append(reward)
         lengths.append(length)
@@ -309,7 +385,7 @@ def collect_rollouts_serial(env_args, agent, args, progress, update, last_eval_r
     lengths = []
     macros = []
     for episode in range(1, args.episodes_per_update + 1):
-        env = ForagingEnvironment(*env_args)
+        env = ForagingEnvironment(*make_env_args(env_args))
         reward, length, macro_count = run_episode(env, agent, deterministic=False, train=True)
         rewards.append(reward)
         lengths.append(length)
@@ -394,6 +470,18 @@ def parse_args():
     parser.add_argument("--height", type=int, default=5)
     parser.add_argument("--objects", type=int, default=10)
     parser.add_argument("--agents", type=int, default=5)
+    parser.add_argument("--min-height", type=int, default=None)
+    parser.add_argument("--max-height-train", type=int, default=None)
+    parser.add_argument("--min-width", type=int, default=None)
+    parser.add_argument("--max-width-train", type=int, default=None)
+    parser.add_argument("--min-agents", type=int, default=None)
+    parser.add_argument("--max-agents-train", type=int, default=None)
+    parser.add_argument("--min-objects", type=int, default=None)
+    parser.add_argument("--max-objects-train", type=int, default=None)
+    parser.add_argument("--min-occupancy", type=float, default=0.25)
+    parser.add_argument("--max-occupancy", type=float, default=0.65)
+    parser.add_argument("--min-objects-per-agent", type=float, default=1.5)
+    parser.add_argument("--max-objects-per-agent", type=float, default=3.0)
     parser.add_argument("--updates", type=int, default=1000, help="Updates to run. With --resume/--resume-from, this is the number of additional updates.")
     parser.add_argument("--episodes-per-update", type=int, default=16)
     parser.add_argument("--eval-every", type=int, default=25)
@@ -413,18 +501,6 @@ def parse_args():
     parser.add_argument("--entropy-coef", type=float, default=0.01)
     parser.add_argument("--ppo-epochs", type=int, default=4)
     parser.add_argument("--max-plan-steps", type=int, default=None)
-    parser.add_argument(
-        "--repeated-sync-penalty",
-        type=float,
-        default=0.0,
-        help="Penalty for sync choices after the free sync budget. Cost is penalty * nth sync use since the last object collection.",
-    )
-    parser.add_argument(
-        "--free-syncs-after-object",
-        type=int,
-        default=1,
-        help="Free sync choices per agent after each object collection before repeated sync penalties apply.",
-    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--run-name", default=None, help="Name for runs/<run-name> outputs.")
@@ -593,6 +669,8 @@ def save_best_checkpoint(agent, checkpoint_dir, update, eval_reward, best_checkp
 
 def main():
     args = parse_args()
+    normalize_sampling_args(args)
+    validate_env_args(args.height, args.width, args.objects, args.agents)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     args.device = str(resolve_device(args.device, strict=args.strict_device))
@@ -610,11 +688,12 @@ def main():
         print(f"resume_from={resume_path}")
     print(f"device={args.device}")
 
-    env_args = (args.height, args.width, args.objects, args.agents)
+    env_sampler_config = make_sampler_config(args)
+    env_args = env_sampler_config
     agent = AutoregressiveAssignmentPPOAgent(
-        w=args.width,
-        h=args.height,
-        agents=args.agents,
+        w=args.max_width_train,
+        h=args.max_height_train,
+        agents=args.max_agents_train,
         device=args.device,
         hidden_dim=args.hidden_dim,
         gamma=args.gamma,
@@ -625,8 +704,6 @@ def main():
         entropy_coef=args.entropy_coef,
         ppo_epochs=args.ppo_epochs,
         max_plan_steps=args.max_plan_steps,
-        repeated_sync_penalty=args.repeated_sync_penalty,
-        free_syncs_after_object=args.free_syncs_after_object,
     )
 
     loaded_checkpoint = None
@@ -806,12 +883,7 @@ def main():
                     "max_candidate_count": stats.get("max_candidate_count", 0),
                     "recompute_batches": stats.get("recompute_batches", 0),
                     "avg_recompute_batch_size": stats.get("avg_recompute_batch_size", 0.0),
-                    "sync_choice_rate": stats.get("sync_choice_rate", 0.0),
-                    "zero_distance_sync_choice_rate": stats.get("zero_distance_sync_choice_rate", 0.0),
-                    "sync_bump_completed_count": stats.get("sync_bump_completed_count", 0),
-                    "sync_reached_but_not_bumped_count": stats.get("sync_reached_but_not_bumped_count", 0),
                     "decision_trigger_object_collected": stats.get("decision_trigger_object_collected", 0),
-                    "decision_trigger_goals_completed": stats.get("decision_trigger_goals_completed", 0),
                     "decision_trigger_max_plan_steps": stats.get("decision_trigger_max_plan_steps", 0),
                     "remaining_objects_at_episode_end": stats.get("remaining_objects_at_episode_end", 0.0),
                 }

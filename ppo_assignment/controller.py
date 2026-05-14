@@ -1,5 +1,3 @@
-import random
-
 NORTH = 0
 SOUTH = 1
 WEST = 2
@@ -15,38 +13,6 @@ def extract_objects(world_map):
     return objects
 
 
-def unique_goals(goals):
-    result = []
-    seen = set()
-    for goal in goals:
-        if goal not in seen:
-            result.append(goal)
-            seen.add(goal)
-    return result
-
-
-def edge_sync_goals(h, w):
-    goals = []
-    seen = set()
-    for x in range(h):
-        for y in range(w):
-            if x in (0, h - 1) or y in (0, w - 1):
-                if (x, y) not in seen:
-                    goals.append(("sync", x, y, 0))
-                    seen.add((x, y))
-    return goals
-
-
-def agent_sync_goals(agent_pos, h, w):
-    agent_x, agent_y = agent_pos
-    return [
-        ("sync", 0, agent_y, 0),
-        ("sync", h - 1, agent_y, 0),
-        ("sync", agent_x, 0, 0),
-        ("sync", agent_x, w - 1, 0),
-    ]
-
-
 def object_goals(world_map):
     return [
         ("object", x, y, level)
@@ -55,18 +21,18 @@ def object_goals(world_map):
 
 
 def extract_goals(world_map, h, w):
-    return object_goals(world_map) + edge_sync_goals(h, w)
+    del h, w
+    return object_goals(world_map)
 
 
 def candidate_goals_for_agent(world_map, agent_pos, h, w):
-    return object_goals(world_map) + agent_sync_goals(agent_pos, h, w)
+    del agent_pos, h, w
+    return object_goals(world_map)
 
 
 def critic_goals(world_map, agent_locations, h, w):
-    sync_goals = []
-    for agent_pos in agent_locations:
-        sync_goals.extend(agent_sync_goals(agent_pos, h, w))
-    return object_goals(world_map) + unique_goals(sync_goals)
+    del agent_locations, h, w
+    return object_goals(world_map)
 
 
 def target_exists(world_map, target):
@@ -84,11 +50,7 @@ def goal_position(goal):
 
 
 def goal_level(goal):
-    if goal[0] == "object":
-        return goal[3]
-    if goal[0] == "sync":
-        return 0
-    raise ValueError(f"Unknown goal kind: {goal[0]}")
+    return goal[3]
 
 
 def manhattan(agent_pos, goal):
@@ -112,24 +74,6 @@ def all_agents_at_targets(agent_locations, active_plan):
     return all_agents_at_goals(agent_locations, active_plan)
 
 
-def all_agents_completed_macro_goals(agent_locations, active_plan, sync_bumped):
-    if not active_plan:
-        return False
-    if len(active_plan) != len(agent_locations):
-        return False
-
-    for agent_idx, agent_pos in enumerate(agent_locations):
-        if agent_idx not in active_plan:
-            return False
-        goal = active_plan[agent_idx]
-        if goal[0] == "sync":
-            if not sync_bumped.get(agent_idx, False):
-                return False
-        elif manhattan(agent_pos, goal) != 0:
-            return False
-    return True
-
-
 def outward_wall_bump_action(goal, h, w):
     x, y = goal_position(goal)
     if x == 0:
@@ -140,7 +84,18 @@ def outward_wall_bump_action(goal, h, w):
         return WEST
     if y == w - 1:
         return EAST
-    return random.randrange(0, 4)
+    return legal_pace_action((x, y), h, w)
+
+
+def legal_pace_action(agent_pos, h, w):
+    x, y = agent_pos
+    if w > 1:
+        if y < w - 1:
+            return EAST
+        return WEST
+    if x < h - 1:
+        return SOUTH
+    return NORTH
 
 
 def move_towards(agent_pos, goal, h, w):
@@ -156,7 +111,7 @@ def move_towards(agent_pos, goal, h, w):
     if ay > ty:
         return WEST
 
-    return outward_wall_bump_action(goal, h, w)
+    return legal_pace_action(agent_pos, h, w)
 
 
 def goals_to_actions(agent_locations, active_plan, h, w):
@@ -164,7 +119,7 @@ def goals_to_actions(agent_locations, active_plan, h, w):
     for agent_idx, agent_pos in enumerate(agent_locations):
         goal = active_plan.get(agent_idx) if active_plan else None
         if goal is None:
-            actions.append(random.randrange(0, 4))
+            actions.append(legal_pace_action(agent_pos, h, w))
         else:
             actions.append(move_towards(agent_pos, goal, h, w))
     return actions
