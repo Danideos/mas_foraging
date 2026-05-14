@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=foraging-ppo
+#SBATCH --job-name=foraging-ppo-8pt
 #SBATCH --partition=gpu-ffa
 #SBATCH --gres=gpu:1
 #SBATCH --time=12:00:00
@@ -44,24 +44,24 @@ print("gpu:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "n
 PY
 
 python -m ppo_assignment.train \
-  --run-name ppo_5x5_5a_new \
+  --run-name ppo_8pt_5x5_2a \
   --runs-dir runs \
-  --updates 3000 \
+  --updates 1000 \
   --episodes-per-update 256 \
   --eval-every 25 --eval-episodes 20 \
-  --hidden-dim 256 --ppo-epochs 1 --ppo-minibatch-size 512 --ppo-token-budget 8192 \
-  --lr 0.0001 --gamma 0.99 --gae-lambda 0.95 \
-  --clip-eps 0.05 --value-coef 1.0 --entropy-coef 0.001 \
-  --max-plan-steps 15 \
+  --hidden-dim 128 --ppo-epochs 2 --ppo-minibatch-size 512 --ppo-token-budget 8192 \
+  --lr 0.00025 --gamma 0.99 --gae-lambda 0.95 \
+  --clip-eps 0.15 --value-coef 0.5 --entropy-coef 0.015 \
+  --max-plan-steps 10 \
   --device cuda \
   --workers 64 --worker-chunk-size 0 --worker-torch-threads 1 \
   --worker-transport plain \
   --keep-best-checkpoints 5 \
   --strict-device \
   --eval-seed 12345 \
-  --min-height 4 --max-height-train 25 \
-  --min-width 4 --max-width-train 25 \
-  --min-agents 2 --max-agents-train 10 \
-  --min-objects 3 --max-objects-train 30 \
-  --min-occupancy 0.25 --max-occupancy 0.65 \
-  --min-objects-per-agent 1.5 --max-objects-per-agent 3.0
+  --min-height 5 --max-height-train 5 \
+  --min-width 5 --max-width-train 5 \
+  --min-agents 2 --max-agents-train 2 \
+  --min-objects 3 --max-objects-train 23 \
+  --min-occupancy 0.20 --max-occupancy 1.0 \
+  --min-objects-per-agent 1.5 --max-objects-per-agent 11.0
