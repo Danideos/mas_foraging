@@ -337,11 +337,11 @@ def transition_from_plain(d):
     )
 
 
-def rollout_worker(actor_state, critic_state, seed, episodes, worker_transport):
+def rollout_worker(actor_state, critic_state, seed, env_args, episodes, worker_transport):
     random.seed(seed)
     torch.manual_seed(seed)
 
-    if _WORKER_AGENT is None or _WORKER_ENV_ARGS is None:
+    if _WORKER_AGENT is None:
         raise RuntimeError("Rollout worker was not initialized.")
 
     _WORKER_AGENT.actor.load_state_dict(actor_state)
@@ -353,7 +353,7 @@ def rollout_worker(actor_state, critic_state, seed, episodes, worker_transport):
     lengths = []
     macros = []
     for _ in range(episodes):
-        env = ForagingEnvironment(*make_env_args(_WORKER_ENV_ARGS))
+        env = ForagingEnvironment(*env_args)
         reward, length, macro_count = run_episode(env, _WORKER_AGENT, deterministic=False, train=True)
         rewards.append(reward)
         lengths.append(length)
@@ -385,7 +385,7 @@ def collect_rollouts_serial(env_args, agent, args, progress, update, last_eval_r
     lengths = []
     macros = []
     for episode in range(1, args.episodes_per_update + 1):
-        env = ForagingEnvironment(*make_env_args(env_args))
+        env = ForagingEnvironment(*env_args)
         reward, length, macro_count = run_episode(env, agent, deterministic=False, train=True)
         rewards.append(reward)
         lengths.append(length)
@@ -403,7 +403,7 @@ def collect_rollouts_serial(env_args, agent, args, progress, update, last_eval_r
     return rewards, lengths, macros, agent.get_rollout_metrics()
 
 
-def collect_rollouts_parallel(agent, args, progress, update, last_eval_reward, executor):
+def collect_rollouts_parallel(env_args, agent, args, progress, update, last_eval_reward, executor):
     actor_state = cpu_state_dict(agent.actor)
     critic_state = cpu_state_dict(agent.critic)
     chunks = episode_chunks(args.episodes_per_update, args.workers, args.worker_chunk_size)
@@ -428,6 +428,7 @@ def collect_rollouts_parallel(agent, args, progress, update, last_eval_reward, e
                 actor_state,
                 critic_state,
                 args.seed + update * 100_000 + chunk_idx * 1_003,
+                env_args,
                 chunks[chunk_idx],
                 args.worker_transport,
             )
@@ -689,7 +690,6 @@ def main():
     print(f"device={args.device}")
 
     env_sampler_config = make_sampler_config(args)
-    env_args = env_sampler_config
     agent = AutoregressiveAssignmentPPOAgent(
         w=args.max_width_train,
         h=args.max_height_train,
@@ -713,7 +713,7 @@ def main():
         loaded_checkpoint = agent.load(resume_path, load_optimizer=True)
         print(f"loaded_checkpoint={resume_path}")
 
-    baseline = evaluate_agent(env_args, RandomAgent(), args.eval_episodes, seed=args.eval_seed)
+    baseline = evaluate_agent(env_sampler_config, RandomAgent(), args.eval_episodes, seed=args.eval_seed)
     print(
         "random_baseline "
         f"avg_reward={baseline['avg_reward']:.3f} "
@@ -748,7 +748,7 @@ def main():
             max_workers=args.workers,
             initializer=init_rollout_worker,
             initargs=(
-                env_args,
+                None,
                 make_agent_kwargs(args, device="cpu"),
                 args.worker_torch_threads,
             ),
@@ -759,8 +759,10 @@ def main():
             update_start = time.perf_counter()
             agent.rollout_buffer.clear()
             rollout_start = time.perf_counter()
+            env_args = sample_env_args(env_sampler_config)
             if args.workers > 1:
                 rewards, lengths, macros, rollout_metric_counts = collect_rollouts_parallel(
+                    env_args,
                     agent,
                     args,
                     progress,
@@ -814,7 +816,7 @@ def main():
             if update % args.eval_every == 0 or update == end_update:
                 progress.set_description(f"evaluating update {update}/{end_update}")
                 eval_start = time.perf_counter()
-                eval_stats = evaluate_agent(env_args, agent, args.eval_episodes, seed=args.eval_seed)
+                eval_stats = evaluate_agent(env_sampler_config, agent, args.eval_episodes, seed=args.eval_seed)
                 eval_sec = time.perf_counter() - eval_start
                 last_eval_reward = eval_stats["avg_reward"]
                 progress.set_description("training PPO")
