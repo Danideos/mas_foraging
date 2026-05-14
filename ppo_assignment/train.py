@@ -614,6 +614,10 @@ def make_metrics_writer(log_dir, append=False):
     fieldnames = [
         "update",
         "episodes",
+        "env_height",
+        "env_width",
+        "env_objects",
+        "env_agents",
         "workers",
         "worker_chunk_size",
         "device",
@@ -785,6 +789,7 @@ def main():
             agent.rollout_buffer.clear()
             rollout_start = time.perf_counter()
             env_args = sample_env_args(env_sampler_config)
+            env_height, env_width, env_objects, env_agents = env_args
             if args.workers > 1:
                 rewards, lengths, macros, rollout_metric_counts = collect_rollouts_parallel(
                     env_args,
@@ -820,6 +825,7 @@ def main():
             eval_stats = None
             progress.set_postfix(
                 update=f"{update}/{end_update}",
+                env=f"{env_height}x{env_width}/{env_objects}o/{env_agents}a",
                 reward=f"{avg_reward:.2f}",
                 length=f"{avg_length:.1f}",
                 macros=f"{avg_macros:.1f}",
@@ -832,6 +838,7 @@ def main():
                 tqdm.write(
                     f"update={update:04d} "
                     f"avg_reward={avg_reward:.3f} "
+                    f"env={env_height}x{env_width} objects={env_objects} agents={env_agents} "
                     f"avg_length={avg_length:.1f} "
                     f"avg_macros={avg_macros:.1f} "
                     f"avg_macro_duration={avg_duration:.2f} "
@@ -878,6 +885,10 @@ def main():
                 {
                     "update": update,
                     "episodes": len(rewards),
+                    "env_height": env_height,
+                    "env_width": env_width,
+                    "env_objects": env_objects,
+                    "env_agents": env_agents,
                     "workers": args.workers,
                     "worker_chunk_size": args.worker_chunk_size,
                     "device": args.device,
