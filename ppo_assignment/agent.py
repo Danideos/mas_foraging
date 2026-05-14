@@ -263,6 +263,64 @@ class AutoregressiveAssignmentPPOAgent:
                 visible_counts[goal] += 1
         return locked_counts, visible_counts
 
+    def feasible_assignment_mask(
+        self,
+        candidate_goals,
+        all_goals,
+        active_plan_before,
+        visible_agent_indices,
+        visible_targets,
+        remaining_visible_after,
+    ):
+        locked_counts, visible_counts = self.assignment_counts(
+            all_goals,
+            active_plan_before,
+            visible_agent_indices,
+            visible_targets=visible_targets,
+        )
+        base_counts = {
+            goal: locked_counts.get(goal, 0) + visible_counts.get(goal, 0)
+            for goal in all_goals
+        }
+        mask = []
+        for candidate_goal in candidate_goals:
+            counts_after = dict(base_counts)
+            if candidate_goal in counts_after:
+                counts_after[candidate_goal] += 1
+            can_fulfill_any = any(
+                count >= goal[3] or count + remaining_visible_after >= goal[3]
+                for goal, count in counts_after.items()
+            )
+            mask.append(can_fulfill_any)
+
+        # Some generated environments may contain no object that the current
+        # visible set can complete. In that case, keep PPO numerically alive and
+        # let the timeout/collection logic handle progress.
+        if mask and not any(mask):
+            return [True] * len(mask)
+        return mask
+
+    def apply_feasibility_mask(
+        self,
+        logits,
+        candidate_goals,
+        all_goals,
+        active_plan_before,
+        visible_agent_indices,
+        visible_targets,
+        remaining_visible_after,
+    ):
+        mask = self.feasible_assignment_mask(
+            candidate_goals,
+            all_goals,
+            active_plan_before,
+            visible_agent_indices,
+            visible_targets,
+            remaining_visible_after,
+        )
+        mask_tensor = torch.tensor(mask, dtype=torch.bool, device=logits.device)
+        return logits.masked_fill(~mask_tensor, -1e9)
+
     def assignment_context(self, agent_pos, candidate_goals, active_plan_before, visible_agent_indices, visible_targets, h, w):
         distance_scale = max(float((h - 1) + (w - 1)), 1.0)
         agent_scale = max(float(len(active_plan_before or {}) or self.agents), 1.0)
@@ -575,6 +633,15 @@ class AutoregressiveAssignmentPPOAgent:
                 num_agents,
                 assignment_context=assignment_context,
             )
+            logits = self.apply_feasibility_mask(
+                logits,
+                candidate_goals,
+                encoder_goals,
+                active_plan_before,
+                visible_agent_indices,
+                visible_targets_so_far,
+                len(agent_order) - step_idx - 1,
+            )
             dist = Categorical(logits=logits)
             if deterministic:
                 selected_goal_idx = torch.argmax(logits)
@@ -738,6 +805,15 @@ class AutoregressiveAssignmentPPOAgent:
                 num_agents,
                 assignment_context=assignment_context,
             )
+            logits = self.apply_feasibility_mask(
+                logits,
+                candidate_goals,
+                encoder_goals,
+                active_plan_before,
+                visible_agent_indices,
+                visible_targets_so_far,
+                len(agent_order) - step_idx - 1,
+            )
             dist = Categorical(logits=logits)
             action_tensor = torch.tensor(stored_candidate_goal_idx, dtype=torch.long, device=self.device)
             new_joint_logprob = new_joint_logprob + dist.log_prob(action_tensor)
@@ -856,6 +932,19 @@ class AutoregressiveAssignmentPPOAgent:
                 num_agents,
                 assignment_context_batch=assignment_context_batch,
             )
+            feasibility_masks = [
+                self.feasible_assignment_mask(
+                    candidate_goals_batch_all[row],
+                    encoder_goals_batch[row],
+                    transitions[row].active_plan_before or {},
+                    visible_indices_batch[row],
+                    visible_targets_so_far_batch[row],
+                    visible_steps - step_idx - 1,
+                )
+                for row in range(batch_size)
+            ]
+            mask_tensor = torch.tensor(feasibility_masks, dtype=torch.bool, device=self.device)
+            logits = logits.masked_fill(~mask_tensor, -1e9)
             dist = Categorical(logits=logits)
             action_tensor = torch.tensor(stored_candidate_goal_indices_all, dtype=torch.long, device=self.device)
             new_joint_logprob = new_joint_logprob + dist.log_prob(action_tensor)
