@@ -38,6 +38,8 @@ class AutoregressiveAssignmentPPOAgent:
         entropy_coef=0.01,
         ppo_epochs=4,
         max_plan_steps=None,
+        ppo_minibatch_size=256,
+        ppo_token_budget=8192,
     ):
         self.w = w
         self.h = h
@@ -50,6 +52,8 @@ class AutoregressiveAssignmentPPOAgent:
         self.entropy_coef = entropy_coef
         self.ppo_epochs = ppo_epochs
         self.max_plan_steps = max_plan_steps if max_plan_steps is not None else max(h + w, 10)
+        self.ppo_minibatch_size = ppo_minibatch_size
+        self.ppo_token_budget = ppo_token_budget
 
         self.actor = Actor(hidden_dim=hidden_dim).to(self.device)
         self.critic = Critic(hidden_dim=hidden_dim).to(self.device)
@@ -62,6 +66,56 @@ class AutoregressiveAssignmentPPOAgent:
         self.reset_rollout_metrics()
         self.reset_episode_state()
         self.last_update_stats = {}
+
+    def model_batch_size(self, num_agents, num_goals):
+        max_batch_size = max(int(self.ppo_minibatch_size), 1)
+        token_budget = int(self.ppo_token_budget or 0)
+        if token_budget <= 0:
+            return max_batch_size
+        tokens_per_transition = max(int(num_agents) + int(num_goals), 1)
+        return max(1, min(max_batch_size, token_budget // tokens_per_transition))
+
+    def batch_slices(self, length, batch_size=None):
+        if batch_size is None:
+            batch_size = self.ppo_minibatch_size
+        batch_size = max(int(batch_size), 1)
+        for start in range(0, length, batch_size):
+            yield start, min(start + batch_size, length)
+
+    def index_subset(self, values, indices):
+        return [values[idx] for idx in indices]
+
+    def transition_token_count(self, transition):
+        visible_count = (
+            len(transition.decision_state[1])
+            if transition.visible_agent_indices is None
+            else len(transition.visible_agent_indices)
+        )
+        return max(visible_count + self.transition_candidate_count(transition), 1)
+
+    def dynamic_transition_batches(self, indices, transitions):
+        max_batch_size = max(int(self.ppo_minibatch_size), 1)
+        token_budget = int(self.ppo_token_budget or 0)
+        if token_budget <= 0:
+            for start, end in self.batch_slices(len(indices), max_batch_size):
+                yield indices[start:end]
+            return
+
+        current = []
+        current_tokens = 0
+        for idx in indices:
+            transition_tokens = self.transition_token_count(transitions[idx])
+            if current and (
+                len(current) >= max_batch_size
+                or current_tokens + transition_tokens > token_budget
+            ):
+                yield current
+                current = []
+                current_tokens = 0
+            current.append(idx)
+            current_tokens += transition_tokens
+        if current:
+            yield current
 
     def reset_rollout_metrics(self):
         self.rollout_metrics = {
@@ -740,21 +794,24 @@ class AutoregressiveAssignmentPPOAgent:
             else:
                 groups[(h, w, len(visible_locations), len(goals))].append(idx)
 
-        for (h, w, num_agents, _), indices in groups.items():
-            group_states = [
-                (states[idx][0], visible_locations_cache[idx])
-                for idx in indices
-            ]
-            group_goals = [goals_cache[idx] for idx in indices]
-            group_values = self.critic.forward_batch(
-                group_states,
-                h,
-                w,
-                num_agents,
-                group_goals,
-            )
-            for offset, original_idx in enumerate(indices):
-                values[original_idx] = group_values[offset]
+        for (h, w, num_agents, num_goals), indices in groups.items():
+            batch_size = self.model_batch_size(num_agents, num_goals)
+            for start, end in self.batch_slices(len(indices), batch_size):
+                chunk_indices = indices[start:end]
+                group_states = [
+                    (states[idx][0], visible_locations_cache[idx])
+                    for idx in chunk_indices
+                ]
+                group_goals = [goals_cache[idx] for idx in chunk_indices]
+                group_values = self.critic.forward_batch(
+                    group_states,
+                    h,
+                    w,
+                    num_agents,
+                    group_goals,
+                )
+                for offset, original_idx in enumerate(chunk_indices):
+                    values[original_idx] = group_values[offset]
 
         return torch.stack(values)
 
@@ -778,14 +835,22 @@ class AutoregressiveAssignmentPPOAgent:
             )
             groups[(h, w, visible_count, goal_count)].append(idx)
 
-        self._last_recompute_batches = len(groups)
-        self._last_avg_recompute_batch_size = len(transitions) / max(len(groups), 1)
-        for indices in groups.values():
-            group_transitions = [transitions[idx] for idx in indices]
-            group_logprobs, group_entropies = self.recompute_logprob_batch(group_transitions)
-            for offset, original_idx in enumerate(indices):
-                logprobs[original_idx] = group_logprobs[offset]
-                entropies[original_idx] = group_entropies[offset]
+        chunk_count = 0
+        chunk_size_sum = 0
+        for (_, _, num_agents, num_goals), indices in groups.items():
+            batch_size = self.model_batch_size(num_agents, num_goals)
+            for start, end in self.batch_slices(len(indices), batch_size):
+                chunk_indices = indices[start:end]
+                group_transitions = [transitions[idx] for idx in chunk_indices]
+                group_logprobs, group_entropies = self.recompute_logprob_batch(group_transitions)
+                chunk_count += 1
+                chunk_size_sum += len(chunk_indices)
+                for offset, original_idx in enumerate(chunk_indices):
+                    logprobs[original_idx] = group_logprobs[offset]
+                    entropies[original_idx] = group_entropies[offset]
+
+        self._last_recompute_batches = chunk_count
+        self._last_avg_recompute_batch_size = chunk_size_sum / max(chunk_count, 1)
 
         return torch.stack(logprobs), torch.stack(entropies)
 
@@ -846,58 +911,84 @@ class AutoregressiveAssignmentPPOAgent:
 
         stats = {}
         for _ in range(self.ppo_epochs):
-            recompute_start = time.perf_counter()
-            new_logprob_tensor, new_entropy_tensor = self.recompute_logprob_all_batched(transitions)
-            recompute_logprob_sec += time.perf_counter() - recompute_start
-            critic_start = time.perf_counter()
-            new_value_tensor = self.critic_values_batch(
-                [transition.decision_state for transition in transitions],
-                visible_agent_indices_batch=[transition.visible_agent_indices for transition in transitions],
-                filtered_goals_batch=[transition.filtered_goals for transition in transitions],
-            )
-            critic_value_sec += time.perf_counter() - critic_start
-            old_logprob_tensor = torch.tensor(
-                [
-                    float(transition.old_joint_logprob)
-                    if not isinstance(transition.old_joint_logprob, torch.Tensor)
-                    else float(transition.old_joint_logprob.detach().cpu().item())
-                    for transition in transitions
-                ],
-                dtype=torch.float32,
-                device=self.device,
-            )
+            epoch_indices = list(range(len(transitions)))
+            random.shuffle(epoch_indices)
+            total_recompute_batches = 0
+            total_recompute_samples = 0
+            loss_sum = 0.0
+            actor_loss_sum = 0.0
+            critic_loss_sum = 0.0
+            entropy_sum = 0.0
+            sample_count = 0
 
-            ratio = torch.exp(new_logprob_tensor - old_logprob_tensor)
-            unclipped = ratio * advantage_tensor
-            clipped = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantage_tensor
-            actor_loss = -torch.min(unclipped, clipped).mean()
-            critic_loss = ((new_value_tensor - target_tensor) ** 2).mean()
-            entropy_bonus = new_entropy_tensor.mean()
-            loss = actor_loss + self.value_coef * critic_loss - self.entropy_coef * entropy_bonus
+            for batch_indices in self.dynamic_transition_batches(epoch_indices, transitions):
+                batch_transitions = self.index_subset(transitions, batch_indices)
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(self.actor.parameters()) + list(self.critic.parameters()),
-                max_norm=1.0,
-            )
-            self.optimizer.step()
+                recompute_start = time.perf_counter()
+                new_logprob_tensor, new_entropy_tensor = self.recompute_logprob_all_batched(batch_transitions)
+                recompute_logprob_sec += time.perf_counter() - recompute_start
+                total_recompute_batches += self._last_recompute_batches
+                total_recompute_samples += len(batch_transitions)
+                critic_start = time.perf_counter()
+                new_value_tensor = self.critic_values_batch(
+                    [transition.decision_state for transition in batch_transitions],
+                    visible_agent_indices_batch=[transition.visible_agent_indices for transition in batch_transitions],
+                    filtered_goals_batch=[transition.filtered_goals for transition in batch_transitions],
+                )
+                critic_value_sec += time.perf_counter() - critic_start
+                old_logprob_tensor = torch.tensor(
+                    [
+                        float(transition.old_joint_logprob)
+                        if not isinstance(transition.old_joint_logprob, torch.Tensor)
+                        else float(transition.old_joint_logprob.detach().cpu().item())
+                        for transition in batch_transitions
+                    ],
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                batch_advantages = advantage_tensor[batch_indices]
+                batch_targets = target_tensor[batch_indices]
+
+                ratio = torch.exp(new_logprob_tensor - old_logprob_tensor)
+                unclipped = ratio * batch_advantages
+                clipped = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * batch_advantages
+                actor_loss = -torch.min(unclipped, clipped).mean()
+                critic_loss = ((new_value_tensor - batch_targets) ** 2).mean()
+                entropy_bonus = new_entropy_tensor.mean()
+                loss = actor_loss + self.value_coef * critic_loss - self.entropy_coef * entropy_bonus
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.actor.parameters()) + list(self.critic.parameters()),
+                    max_norm=1.0,
+                )
+                self.optimizer.step()
+
+                batch_size = len(batch_transitions)
+                sample_count += batch_size
+                loss_sum += float(loss.detach().cpu()) * batch_size
+                actor_loss_sum += float(actor_loss.detach().cpu()) * batch_size
+                critic_loss_sum += float(critic_loss.detach().cpu()) * batch_size
+                entropy_sum += float(entropy_bonus.detach().cpu()) * batch_size
 
             stats = {
                 "transitions": len(transitions),
-                "loss": float(loss.detach().cpu()),
-                "actor_loss": float(actor_loss.detach().cpu()),
-                "critic_loss": float(critic_loss.detach().cpu()),
-                "entropy": float(entropy_bonus.detach().cpu()),
+                "loss": loss_sum / max(sample_count, 1),
+                "actor_loss": actor_loss_sum / max(sample_count, 1),
+                "critic_loss": critic_loss_sum / max(sample_count, 1),
+                "entropy": entropy_sum / max(sample_count, 1),
                 "avg_macro_duration": sum(t.duration for t in transitions) / len(transitions),
                 "recompute_logprob_sec": recompute_logprob_sec,
                 "critic_value_sec": critic_value_sec,
                 "num_macro_transitions": len(transitions),
+                "ppo_minibatch_size": self.ppo_minibatch_size,
+                "ppo_token_budget": self.ppo_token_budget,
                 "avg_candidate_count": sum(self.transition_candidate_count(t) for t in transitions) / len(transitions),
                 "min_candidate_count": min(self.transition_candidate_count(t) for t in transitions),
                 "max_candidate_count": max(self.transition_candidate_count(t) for t in transitions),
-                "recompute_batches": self._last_recompute_batches,
-                "avg_recompute_batch_size": self._last_avg_recompute_batch_size,
+                "recompute_batches": total_recompute_batches,
+                "avg_recompute_batch_size": total_recompute_samples / max(total_recompute_batches, 1),
             }
 
         self.rollout_buffer.clear()
@@ -920,6 +1011,8 @@ class AutoregressiveAssignmentPPOAgent:
                     "entropy_coef": self.entropy_coef,
                     "ppo_epochs": self.ppo_epochs,
                     "max_plan_steps": self.max_plan_steps,
+                    "ppo_minibatch_size": self.ppo_minibatch_size,
+                    "ppo_token_budget": self.ppo_token_budget,
                 },
             }
         checkpoint.update(metadata)

@@ -49,7 +49,7 @@ python -m ppo_assignment.train \
   --updates 3000 \
   --episodes-per-update 256 \
   --eval-every 25 --eval-episodes 20 \
-  --hidden-dim 256 --ppo-epochs 1 \
+  --hidden-dim 256 --ppo-epochs 1 --ppo-minibatch-size 512 --ppo-token-budget 8192 \
   --lr 0.0001 --gamma 0.99 --gae-lambda 0.95 \
   --clip-eps 0.05 --value-coef 1.0 --entropy-coef 0.001 \
   --max-plan-steps 15 \

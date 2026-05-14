@@ -107,22 +107,6 @@ def validate_env_args(h, w, objects, agents):
         )
 
 
-def normalize_sampling_args(args):
-    defaults = {
-        "min_height": args.height,
-        "max_height_train": args.height,
-        "min_width": args.width,
-        "max_width_train": args.width,
-        "min_agents": args.agents,
-        "max_agents_train": args.agents,
-        "min_objects": args.objects,
-        "max_objects_train": args.objects,
-    }
-    for key, value in defaults.items():
-        if getattr(args, key) is None:
-            setattr(args, key, value)
-
-
 def make_sampler_config(args):
     return {
         "min_height": args.min_height,
@@ -138,6 +122,39 @@ def make_sampler_config(args):
         "min_objects_per_agent": args.min_objects_per_agent,
         "max_objects_per_agent": args.max_objects_per_agent,
     }
+
+
+def validate_sampler_config(config):
+    range_pairs = [
+        ("height", config["min_height"], config["max_height_train"]),
+        ("width", config["min_width"], config["max_width_train"]),
+        ("agents", config["min_agents"], config["max_agents_train"]),
+        ("objects", config["min_objects"], config["max_objects_train"]),
+    ]
+    for name, min_value, max_value in range_pairs:
+        if min_value > max_value:
+            raise ValueError(f"Invalid {name} range: min={min_value}, max={max_value}.")
+
+    if config["min_height"] <= 0 or config["min_width"] <= 0:
+        raise ValueError("Minimum height and width must be positive.")
+    if config["min_agents"] < 2:
+        raise ValueError("Minimum agents must be at least 2.")
+    if config["min_objects"] < 1:
+        raise ValueError("Minimum objects must be at least 1.")
+    if not (0.0 <= config["min_occupancy"] <= config["max_occupancy"] <= 1.0):
+        raise ValueError(
+            "Occupancy bounds must satisfy 0 <= min_occupancy <= max_occupancy <= 1."
+        )
+    if not (0.0 <= config["min_objects_per_agent"] <= config["max_objects_per_agent"]):
+        raise ValueError(
+            "Object-per-agent bounds must satisfy 0 <= min_objects_per_agent <= max_objects_per_agent."
+        )
+
+    random_state = random.getstate()
+    try:
+        sample_env_args(config)
+    finally:
+        random.setstate(random_state)
 
 
 def sample_env_args(config):
@@ -273,6 +290,8 @@ def make_agent_kwargs(args, device):
         "entropy_coef": args.entropy_coef,
         "ppo_epochs": args.ppo_epochs,
         "max_plan_steps": args.max_plan_steps,
+        "ppo_minibatch_size": args.ppo_minibatch_size,
+        "ppo_token_budget": args.ppo_token_budget,
     }
 
 
@@ -467,18 +486,14 @@ def collect_rollouts_parallel(env_args, agent, args, progress, update, last_eval
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train event-driven autoregressive PPO for foraging.")
-    parser.add_argument("--width", type=int, default=5)
-    parser.add_argument("--height", type=int, default=5)
-    parser.add_argument("--objects", type=int, default=10)
-    parser.add_argument("--agents", type=int, default=5)
-    parser.add_argument("--min-height", type=int, default=None)
-    parser.add_argument("--max-height-train", type=int, default=None)
-    parser.add_argument("--min-width", type=int, default=None)
-    parser.add_argument("--max-width-train", type=int, default=None)
-    parser.add_argument("--min-agents", type=int, default=None)
-    parser.add_argument("--max-agents-train", type=int, default=None)
-    parser.add_argument("--min-objects", type=int, default=None)
-    parser.add_argument("--max-objects-train", type=int, default=None)
+    parser.add_argument("--min-height", type=int, default=5)
+    parser.add_argument("--max-height-train", type=int, default=5)
+    parser.add_argument("--min-width", type=int, default=5)
+    parser.add_argument("--max-width-train", type=int, default=5)
+    parser.add_argument("--min-agents", type=int, default=5)
+    parser.add_argument("--max-agents-train", type=int, default=5)
+    parser.add_argument("--min-objects", type=int, default=10)
+    parser.add_argument("--max-objects-train", type=int, default=10)
     parser.add_argument("--min-occupancy", type=float, default=0.25)
     parser.add_argument("--max-occupancy", type=float, default=0.65)
     parser.add_argument("--min-objects-per-agent", type=float, default=1.5)
@@ -501,6 +516,13 @@ def parse_args():
     parser.add_argument("--value-coef", type=float, default=0.5)
     parser.add_argument("--entropy-coef", type=float, default=0.01)
     parser.add_argument("--ppo-epochs", type=int, default=4)
+    parser.add_argument("--ppo-minibatch-size", type=int, default=256)
+    parser.add_argument(
+        "--ppo-token-budget",
+        type=int,
+        default=8192,
+        help="Approximate max sum of agent+goal tokens per PPO minibatch. Use 0 to disable dynamic sizing.",
+    )
     parser.add_argument("--max-plan-steps", type=int, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
@@ -619,6 +641,8 @@ def make_metrics_writer(log_dir, append=False):
         "recompute_logprob_sec",
         "critic_value_sec",
         "num_macro_transitions",
+        "ppo_minibatch_size",
+        "ppo_token_budget",
         "avg_candidate_count",
         "min_candidate_count",
         "max_candidate_count",
@@ -670,8 +694,6 @@ def save_best_checkpoint(agent, checkpoint_dir, update, eval_reward, best_checkp
 
 def main():
     args = parse_args()
-    normalize_sampling_args(args)
-    validate_env_args(args.height, args.width, args.objects, args.agents)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     args.device = str(resolve_device(args.device, strict=args.strict_device))
@@ -690,6 +712,7 @@ def main():
     print(f"device={args.device}")
 
     env_sampler_config = make_sampler_config(args)
+    validate_sampler_config(env_sampler_config)
     agent = AutoregressiveAssignmentPPOAgent(
         w=args.max_width_train,
         h=args.max_height_train,
@@ -704,6 +727,8 @@ def main():
         entropy_coef=args.entropy_coef,
         ppo_epochs=args.ppo_epochs,
         max_plan_steps=args.max_plan_steps,
+        ppo_minibatch_size=args.ppo_minibatch_size,
+        ppo_token_budget=args.ppo_token_budget,
     )
 
     loaded_checkpoint = None
@@ -880,6 +905,8 @@ def main():
                     "recompute_logprob_sec": stats.get("recompute_logprob_sec", 0.0),
                     "critic_value_sec": stats.get("critic_value_sec", 0.0),
                     "num_macro_transitions": stats.get("num_macro_transitions", stats.get("transitions", 0)),
+                    "ppo_minibatch_size": stats.get("ppo_minibatch_size", args.ppo_minibatch_size),
+                    "ppo_token_budget": stats.get("ppo_token_budget", args.ppo_token_budget),
                     "avg_candidate_count": stats.get("avg_candidate_count", 0.0),
                     "min_candidate_count": stats.get("min_candidate_count", 0),
                     "max_candidate_count": stats.get("max_candidate_count", 0),
